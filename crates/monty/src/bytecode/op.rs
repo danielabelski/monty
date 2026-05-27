@@ -493,6 +493,32 @@ pub enum Opcode {
     /// the `suppress` bool.
     /// Appended at the end to preserve the serialized byte values of all older opcodes.
     WithExceptStart,
+
+    // === Comprehension Helpers ===
+    /// Move the value at `TOS - n` to TOS, shifting items above it down by one.
+    /// Operand: u8 n.
+    ///
+    /// Used by the comprehension compiler to bring a nested-tuple sub-target
+    /// up to TOS so it can be `UnpackSequence`-d (UnpackSequence only operates
+    /// on TOS). `n = 0` is a no-op.
+    ///
+    /// At runtime, implemented as a single `Vec::rotate_left(1)` over the
+    /// affected slice, so cost is O(n) shifts but n is bounded by the
+    /// comprehension's nesting depth (almost always tiny).
+    /// Appended at the end to preserve the serialized byte values of all older opcodes.
+    LiftToTop,
+    /// Raise `UnboundLocalError: cannot access local variable 'NAME' where
+    /// it is not associated with a value`. Operand: u16 name_id.
+    ///
+    /// Emitted by the comprehension compiler at sites where static analysis
+    /// proves a comp-target read happens before the corresponding `for`
+    /// assigns it — e.g. `[x for x in [1] for _ in [late] for late in [[2]]]`
+    /// where `late` is read in an earlier generator's iter expression.
+    /// The opcode carries the target's name inline so sibling comprehensions
+    /// that reuse comp-var slots still report the right variable name in the
+    /// error.
+    /// Appended at the end to preserve the serialized byte values of all older opcodes.
+    RaiseUnboundLocal,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -673,6 +699,8 @@ impl Opcode {
             (DictSetItem, Operand::U8(_)) => -2,
             // `DictUpdate`/`SetExtend` also take a u8 stack-depth operand.
             (DictUpdate | SetExtend, Operand::U8(_)) => -1,
+            // `LiftToTop(n)` reorders the stack — net effect 0.
+            (LiftToTop, Operand::U8(_)) => 0,
 
             // === Fixed-effect, no operand (context managers) ===
             // `BeforeWith` pushes the `__enter__` result on top of the existing ctx.
@@ -697,6 +725,10 @@ impl Opcode {
             (DictMerge, Operand::U16(_)) => -1,
             // `RaiseImportError` takes a u16 const_id naming the missing module.
             (RaiseImportError, Operand::U16(_)) => 0,
+            // `RaiseUnboundLocal(name_id)` always raises — fall-through is dead
+            // code, but the tracker absorbs the bytes with effect 0 before the
+            // following region starts.
+            (RaiseUnboundLocal, Operand::U16(_)) => 0,
 
             // === Fixed-effect, U8U16 operand ===
             (LoadLocalCallable, Operand::U8U16(..)) => 1,
@@ -768,7 +800,7 @@ mod tests {
     #[test]
     fn test_opcode_roundtrip() {
         // Verify that all opcodes from 0 to the last opcode can be converted to u8 and back.
-        for byte in 0..=Opcode::WithExceptStart as u8 {
+        for byte in 0..=Opcode::RaiseUnboundLocal as u8 {
             let opcode = Opcode::try_from(byte).unwrap();
             assert_eq!(opcode as u8, byte, "opcode {opcode:?} has wrong discriminant");
         }
@@ -788,12 +820,15 @@ mod tests {
         assert_eq!(Opcode::BeforeWith as u8, 115);
         assert_eq!(Opcode::WithExit as u8, 116);
         assert_eq!(Opcode::WithExceptStart as u8, 117);
+        // Comprehension-support opcodes appended after the context-manager opcodes.
+        assert_eq!(Opcode::LiftToTop as u8, 118);
+        assert_eq!(Opcode::RaiseUnboundLocal as u8, 119);
     }
 
     #[test]
     fn test_invalid_opcode() {
         // Byte just after the last valid opcode should fail
-        let result = Opcode::try_from(Opcode::WithExceptStart as u8 + 1);
+        let result = Opcode::try_from(Opcode::RaiseUnboundLocal as u8 + 1);
         assert!(result.is_err());
         // 255 should also fail
         let result = Opcode::try_from(255u8);

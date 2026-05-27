@@ -385,8 +385,12 @@ impl<'code> CallFrame<'code> {
 
     /// Creates a new call frame for a function call.
     ///
-    /// The frame's locals occupy `stack[stack_base..stack_base + locals_count]`.
-    /// Operands are pushed above the locals region.
+    /// The frame's layout on the VM stack is
+    /// `[locals (locals_count) | operand stack ...]`. `stack_base` points at
+    /// the start of the locals region; comprehension variables are pushed
+    /// onto the operand stack at each comprehension's entry and popped at
+    /// its exit, so they share the same address space as ordinary operand
+    /// values (no separate per-frame region).
     pub fn new_function(
         code: &'code Code,
         stack_base: usize,
@@ -823,6 +827,11 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         // Store module code for restoring main task frames during task switching
         self.module_code = Some(code);
         let exc_stack_base = self.exception_stack.len();
+        // Module frames have locals_count = 0 (globals live in self.globals)
+        // and no frame-level comprehension region — comp targets are pushed
+        // onto the operand stack at each comprehension's entry and popped
+        // at its exit, so they share the same address space as ordinary
+        // operand values.
         self.push_frame(CallFrame::new_module(code, exc_stack_base))?;
         self.run()
     }
@@ -971,6 +980,20 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                 Opcode::StoreLocalW => {
                     let slot = cached_frame.fetch_u16();
                     self.store_local(&cached_frame, slot);
+                }
+                Opcode::LiftToTop => {
+                    let n = cached_frame.fetch_u8();
+                    // Move the item at TOS - n to TOS, shifting items in
+                    // between down by one. Single `rotate_left(1)` on the
+                    // affected slice does exactly that.
+                    let len = self.stack.len();
+                    let src_idx = len - 1 - n as usize;
+                    self.stack[src_idx..].rotate_left(1);
+                }
+                Opcode::RaiseUnboundLocal => {
+                    let name_idx = cached_frame.fetch_u16();
+                    let name_id = StringId::from_index(name_idx);
+                    catch_sync!(self, cached_frame, self.unbound_local_error(0, Some(name_id)));
                 }
                 Opcode::DeleteLocal => {
                     let slot = u16::from(cached_frame.fetch_u8());
@@ -1869,16 +1892,18 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
     }
 
     fn cleanup_frame_state(&mut self, frame: &CallFrame<'_>) {
-        // Clean up frame's stack region (locals + operands).
-        // Locals occupy stack[frame.stack_base..frame.stack_base + frame.locals_count],
-        // operands are above that. Draining from stack_base covers both.
+        // Clean up frame's stack region (locals + operand stack, which now
+        // includes any in-flight comprehension variables — the operand-stack
+        // drain naturally covers them).
         self.stack
             .drain(frame.stack_base..)
             .for_each(|value| value.drop_with_heap(&mut *self.heap));
 
-        // Track freed memory for locals
+        // Track freed memory for the locals region. Matches the `on_allocate`
+        // at each frame-entry site (sync function, module, sync coroutine,
+        // spawned coroutine).
         if frame.locals_count > 0 {
-            let size = frame.locals_count as usize * mem::size_of::<Value>();
+            let size = usize::from(frame.locals_count) * mem::size_of::<Value>();
             self.heap.tracker_mut().on_free(|| size);
         }
     }
