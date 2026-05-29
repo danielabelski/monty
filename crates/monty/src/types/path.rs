@@ -25,7 +25,7 @@ use crate::{
     heap::{DropWithHeap, Heap, HeapData, HeapId, HeapItem, HeapRead},
     intern::{Interns, StaticStrings},
     os::{MontyPath, build_path_os_call, is_path_os_method},
-    resource::{ResourceError, ResourceTracker},
+    resource::ResourceTracker,
     types::{PyTrait, Type, allocate_tuple, str::allocate_string},
     value::{EitherStr, Value},
 };
@@ -470,7 +470,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
         None
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<bool> {
         Ok(self.get(vm.heap).path == other.get(vm.heap).path)
     }
 

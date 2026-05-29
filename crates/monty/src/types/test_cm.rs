@@ -30,7 +30,7 @@ use crate::{
     bytecode::{CallResult, VM},
     exception_private::{ExcType, RunResult, SimpleException},
     heap::{HeapId, HeapItem, HeapRead},
-    resource::{ResourceError, ResourceTracker},
+    resource::ResourceTracker,
     value::Value,
 };
 
@@ -110,7 +110,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TestContextManager> {
         None
     }
 
-    fn py_eq(&self, _other: &Self, _vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq(&self, _other: &Self, _vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<bool> {
         Ok(false)
     }
 

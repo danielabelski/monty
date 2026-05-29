@@ -78,7 +78,7 @@ use crate::{
     heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::StaticStrings,
     os::{MontyPath, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs},
-    resource::{ResourceError, ResourceTracker},
+    resource::ResourceTracker,
     types::str::StringRepr,
     value::{EitherStr, Value},
 };
@@ -516,7 +516,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, OpenFile> {
         None
     }
 
-    fn py_eq(&self, _other: &Self, _vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq(&self, _other: &Self, _vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<bool> {
         Ok(false)
     }
 

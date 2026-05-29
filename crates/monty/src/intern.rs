@@ -692,6 +692,12 @@ pub enum StaticStrings {
     Parents,
     /// Kwarg name `exist_ok` — `Path.mkdir(exist_ok=...)`.
     ExistOk,
+
+    // ==========================
+    // sys module test-hook strings (kept interned unconditionally for the
+    // same StringId-stability reason as the gc entries above).
+    /// `sys.setrecursionlimit()` function (only callable under `test-hooks`).
+    Setrecursionlimit,
 }
 
 impl StaticStrings {
