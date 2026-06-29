@@ -2113,7 +2113,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
 
         // Check for undefined value — raise appropriate error or yield to host
         if matches!(value, Value::Undefined) {
-            let name = self.current_frame().code.local_name(slot);
+            let name = self.global_name(slot);
 
             let Some(name_id) = name else {
                 // No name available — raise NameError directly
@@ -2138,6 +2138,15 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         }
     }
 
+    /// Returns the interned name of a module-level global at `slot`, if known.
+    ///
+    /// Returns `None` if no module code is attached (test harness use of
+    /// `VM::new` without `run_module`) or if the slot is past the recorded
+    /// name table.
+    fn global_name(&self, slot: u16) -> Option<StringId> {
+        self.module_code.and_then(|c| c.local_name(slot))
+    }
+
     /// Pops the top of stack and stores it in a global variable.
     ///
     /// Reassigning a reserved module dunder (see [`RESERVED_MODULE_DUNDERS`]) is
@@ -2156,7 +2165,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
         // TODO: the `Undefined` branch is currently unreachable from Python source,
         // needs support for the `del` statement.
         if matches!(self.globals[slot as usize], Value::Undefined) {
-            let name = self.current_frame().code.local_name(slot);
+            let name = self.global_name(slot);
             return Err(self.name_error(slot, name));
         }
         let old_value = mem::replace(&mut self.globals[slot as usize], Value::Undefined);

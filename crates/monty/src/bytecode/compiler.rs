@@ -31,6 +31,7 @@ use crate::{
     function::Function,
     intern::{Interns, StringId},
     modules::StandardLib,
+    name_map::NameMap,
     parse::{CodeRange, ExceptHandler, Try},
     value::{EitherStr, Value},
 };
@@ -417,9 +418,9 @@ impl<'a> Compiler<'a> {
     pub fn compile_module(
         nodes: &[PreparedNode],
         interns: &Interns,
-        namespace_size: usize,
+        globals: &NameMap,
     ) -> Result<CompileResult, CompileError> {
-        Self::compile_module_with_functions(nodes, interns, namespace_size, Vec::new())
+        Self::compile_module_with_functions(nodes, interns, globals, Vec::new())
     }
 
     /// Compiles module-level code while preserving an existing function table prefix.
@@ -430,14 +431,20 @@ impl<'a> Compiler<'a> {
     pub fn compile_module_with_functions(
         nodes: &[PreparedNode],
         interns: &Interns,
-        namespace_size: usize,
+        globals: &NameMap,
         existing_functions: Vec<Function>,
     ) -> Result<CompileResult, CompileError> {
-        let num_locals = check_namespace_size_u16(namespace_size, "module")?;
+        let num_locals = check_namespace_size_u16(globals.len(), "module")?;
         // Module frames have `locals_count = 0` at runtime (globals live in
         // `self.globals`), so comp-var offsets are emitted as plain operand-
         // stack indices.
         let mut compiler = Compiler::new(interns, existing_functions, true, 0);
+
+        // All globals are "local names" in the module
+        for (slot, name_id) in globals.iter() {
+            compiler.code.register_local_name(slot.as_u16(), name_id);
+        }
+
         compiler.compile_block(nodes)?;
 
         // Module returns None if no explicit return
@@ -1217,8 +1224,10 @@ impl<'a> Compiler<'a> {
                 }
             }
             NameScope::Global => {
-                // Register the name for NameError/NameLookup messages
-                self.code.register_local_name(slot, ident.name_id);
+                // Global name - only a "local" name at module scope
+                if self.is_module_scope {
+                    self.code.register_local_name(slot, ident.name_id);
+                }
                 self.code.emit_u16(Opcode::LoadGlobal, slot)
             }
             NameScope::Cell => {
