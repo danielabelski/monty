@@ -10,7 +10,14 @@
 // delivered when the worker reports everything is blocked (`resolveFutures`).
 
 import type { NativeSession } from '../index.js'
-import { MontyCrashedError, MontyError, montyErrorFromNative, MontyTypingError, ProtocolError } from './errors.js'
+import {
+  MontyCrashedError,
+  MontyError,
+  montyErrorFromNative,
+  MontyTypingError,
+  notCallableMessage,
+  ProtocolError,
+} from './errors.js'
 import { PYTHON_EXC_NAMES } from './errors.js'
 import { mountsToNative, type MountDir } from './mount.js'
 import type {
@@ -47,8 +54,16 @@ export type PrintCallback = (stream: 'stdout' | 'stderr', text: string) => void
 export interface FeedOptions {
   /** Values bound as globals before the snippet runs. */
   inputs?: Record<string, unknown>
-  /** Host functions the sandbox may call by name. */
-  externalFunctions?: Record<string, ExternalFunction>
+  /**
+   * Host values the sandbox may reference by an otherwise-undefined name,
+   * resolved lazily on demand: a function entry becomes a host function the
+   * sandbox can call (sync or async), any other value is converted and
+   * returned directly when the name is read, and an absent name raises
+   * `NameError`. The lazy counterpart to `inputs`, which eagerly binds every
+   * entry as a global whether or not it is referenced; a name in both is
+   * served by the eager `inputs` binding.
+   */
+  externalLookup?: Record<string, unknown>
   /** Receives `print()` output; defaults to the host process stdout/stderr. */
   printCallback?: PrintCallback
   /** Host directories mounted into the sandbox for this feed. */
@@ -61,7 +76,7 @@ export interface FeedOptions {
 
 /**
  * Options for [`MontySession.feedStart`]. Like [`FeedOptions`] without
- * `externalFunctions` — `feedStart` surfaces external calls as snapshots
+ * `externalLookup` — `feedStart` surfaces external calls as snapshots
  * instead of dispatching them.
  */
 export interface FeedStartOptions {
@@ -174,7 +189,7 @@ export class MontySession {
    * snapshot at each external call, OS call, name lookup, or future
    * resolution. Answer it with `snapshot.resume(...)`, which resolves to the
    * next snapshot or a `MontyComplete`. Unlike `feedRun` there is no
-   * `externalFunctions` option — surfacing those calls is the point — but an
+   * `externalLookup` option — surfacing those calls is the point — but an
    * `os` handler still auto-dispatches uncovered OS calls until the next
    * non-OS event. Use `snapshot.dump()` to checkpoint the worker and
    * `loadSnapshot` to restore it.
@@ -360,14 +375,30 @@ export class MontySession {
     try {
       switch (turn.kind) {
         case 'functionCall':
-          next = this.answerFunctionCall(turn, options.externalFunctions, onPrint)
+          next = this.answerFunctionCall(turn, options.externalLookup, onPrint)
           break
         case 'osCall':
           next = this.answerOsCall(turn, options.os, onPrint)
           break
         case 'nameLookup': {
-          const fn = options.externalFunctions?.[turn.name]
-          next = this.native.resumeNameLookup(fn === undefined ? null : fn.name || '<anonymous>', onPrint)
+          // A callable entry resolves to a host function (by display name); any
+          // other value is converted and returned directly; an absent name is
+          // left undefined so the sandbox raises NameError. Only own keys count
+          // — an inherited member (`toString`, `constructor`, …) must never
+          // satisfy a lookup the host did not deliberately expose. The value is
+          // wrapped in `{ value }` so `null`/`undefined` entries resolve to
+          // `None` instead of reading as "no value" through napi.
+          const lookup = options.externalLookup
+          if (lookup === undefined || !Object.prototype.hasOwnProperty.call(lookup, turn.name)) {
+            next = this.native.resumeNameLookup(null, null, onPrint)
+          } else {
+            const v = lookup[turn.name]
+            if (typeof v === 'function') {
+              next = this.native.resumeNameLookup((v as ExternalFunction).name || '<anonymous>', null, onPrint)
+            } else {
+              next = this.native.resumeNameLookup(null, { value: v }, onPrint)
+            }
+          }
           break
         }
         case 'resolveFutures':
@@ -387,7 +418,7 @@ export class MontySession {
   /** Calls the matching external function and resumes with its result. */
   private answerFunctionCall(
     call: FunctionCallTurn,
-    externalFunctions: Record<string, ExternalFunction> | undefined,
+    externalLookup: Record<string, unknown> | undefined,
     onPrint: PrintCallback,
   ): Promise<object> {
     if (call.methodCall) {
@@ -399,10 +430,19 @@ export class MontySession {
         onPrint,
       )
     }
-    const fn = externalFunctions?.[call.functionName]
-    if (fn === undefined) {
+    // Own keys only, as in the nameLookup branch: an inherited callable (e.g.
+    // `Object.prototype.toString`) must never be dispatched as a host function.
+    if (externalLookup === undefined || !Object.prototype.hasOwnProperty.call(externalLookup, call.functionName)) {
       return this.native.resumeNotFound(onPrint)
     }
+    const entry = externalLookup[call.functionName]
+    if (typeof entry !== 'function') {
+      // A cached function proxy whose entry was later replaced by a plain
+      // value: raise what CPython would for calling that value, matching the
+      // Python binding (which really calls the entry).
+      return this.native.resumeError('TypeError', notCallableMessage(entry), onPrint)
+    }
+    const fn = entry as ExternalFunction
     let returned: unknown
     try {
       returned = fn(...(buildCallArgs(call) as never[]))
@@ -637,7 +677,8 @@ class SnapshotDriver {
   }
 
   async resumeNameLookup(functionName: string | null): Promise<Snapshot> {
-    return this.advance((await this.native.resumeNameLookup(functionName, this.onPrint)) as NativeTurn)
+    // feedStart name-lookup snapshots only resolve to functions (by name).
+    return this.advance((await this.native.resumeNameLookup(functionName, null, this.onPrint)) as NativeTurn)
   }
 
   async resolveFutures(results: NativeFutureResult[]): Promise<Snapshot> {

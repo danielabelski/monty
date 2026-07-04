@@ -46,10 +46,10 @@ use tokio::task::{JoinSet, spawn_blocking};
 use crate::{
     async_dispatch::{dispatch_function_call, join_error_to_py, spawn_coroutine_task, wait_for_futures},
     build::{extract_repl_inputs, extract_source_code, extract_type_check_stubs},
-    convert::{get_docstring, monty_to_py, py_to_monty_value},
+    convert::{monty_to_py, py_to_monty_value},
     dataclass::DcRegistry,
     exceptions::{MontyCrashedError, MontyError, MontyTypingError, exc_py_to_monty},
-    external::{CallResult, ExternalFunctionRegistry, dispatch_method_call},
+    external::{CallResult, ExternalLookup, dispatch_method_call},
     get_not_handled,
     limits::extract_limits,
     mount::PyMountDir,
@@ -210,14 +210,14 @@ impl PyMontySession {
     ///
     /// Blocks the calling thread with the GIL released; async external
     /// functions are not supported here — use [`AsyncMonty`].
-    #[pyo3(signature = (code, *, inputs=None, external_functions=None, print_callback=None, mount=None, os=None, skip_type_check=false))]
+    #[pyo3(signature = (code, *, inputs=None, external_lookup=None, print_callback=None, mount=None, os=None, skip_type_check=false))]
     #[expect(clippy::too_many_arguments)]
     fn feed_run(
         &self,
         py: Python<'_>,
         code: &Bound<'_, PyString>,
         inputs: Option<&Bound<'_, PyDict>>,
-        external_functions: Option<&Bound<'_, PyDict>>,
+        external_lookup: Option<&Bound<'_, PyDict>>,
         print_callback: Option<&Bound<'_, PyAny>>,
         mount: Option<&Bound<'_, PyAny>>,
         os: Option<Py<PyAny>>,
@@ -235,7 +235,7 @@ impl PyMontySession {
             os,
             skip_type_check,
         )?;
-        drive_sync(py, args, external_functions)
+        drive_sync(py, args, external_lookup)
     }
 
     /// Starts a snippet but, instead of driving it to completion, returns a
@@ -243,7 +243,7 @@ impl PyMontySession {
     /// resolution. The caller answers with `snapshot.resume(...)` and may
     /// `snapshot.dump()` to checkpoint the worker mid-execution.
     ///
-    /// Unlike [`feed_run`](Self::feed_run) there is no `external_functions`
+    /// Unlike [`feed_run`](Self::feed_run) there is no `external_lookup`
     /// argument — surfacing those calls is the point. An `os=` handler still
     /// auto-dispatches uncovered OS calls until the next non-OS event.
     #[pyo3(signature = (code, *, inputs=None, print_callback=None, mount=None, os=None, skip_type_check=false))]
@@ -668,14 +668,14 @@ impl PyAsyncMontySession {
     /// print callbacks in this process. Session state persists across feeds.
     ///
     /// Worker I/O runs off the event loop via tokio's blocking pool.
-    #[pyo3(signature = (code, *, inputs=None, external_functions=None, print_callback=None, mount=None, os=None, skip_type_check=false))]
+    #[pyo3(signature = (code, *, inputs=None, external_lookup=None, print_callback=None, mount=None, os=None, skip_type_check=false))]
     #[expect(clippy::too_many_arguments)]
     fn feed_run<'py>(
         &self,
         py: Python<'py>,
         code: &Bound<'_, PyString>,
         inputs: Option<&Bound<'_, PyDict>>,
-        external_functions: Option<&Bound<'_, PyDict>>,
+        external_lookup: Option<&Bound<'_, PyDict>>,
         print_callback: Option<&Bound<'_, PyAny>>,
         mount: Option<&Bound<'_, PyAny>>,
         os: Option<Py<PyAny>>,
@@ -693,8 +693,8 @@ impl PyAsyncMontySession {
             os,
             skip_type_check,
         )?;
-        let ext_fns = external_functions.map(|d| d.clone().unbind());
-        future_into_py(py, async move { drive_async(args, ext_fns).await })
+        let ext = external_lookup.map(|d| d.clone().unbind());
+        future_into_py(py, async move { drive_async(args, ext).await })
     }
 
     /// Async counterpart of [`PyMontySession::feed_start`]: the returned
@@ -1034,7 +1034,7 @@ impl FeedArgs {
 
 /// Synchronous drive loop: protocol turns run with the GIL released;
 /// callbacks run between turns with the GIL held.
-fn drive_sync(py: Python<'_>, args: FeedArgs, external_functions: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+fn drive_sync(py: Python<'_>, args: FeedArgs, external_lookup: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
     let FeedArgs {
         code,
         inputs,
@@ -1045,6 +1045,7 @@ fn drive_sync(py: Python<'_>, args: FeedArgs, external_functions: Option<&Bound<
         checkout,
         dc_registry,
     } = args;
+    let lookup = ExternalLookup::new(py, external_lookup, &dc_registry);
     let mut event = {
         let (result, print_err) = py.detach(|| {
             run_turn_blocking(&checkout, &print_target, |c, p| {
@@ -1055,46 +1056,17 @@ fn drive_sync(py: Python<'_>, args: FeedArgs, external_functions: Option<&Bound<
     };
 
     loop {
-        let resume_with: TurnAnswer = match event {
+        // `Complete` ends the loop; on any other event a failure to compute the
+        // answer discards the checkout (see `sync_turn_answer`).
+        let resume_with = match event {
             TurnEvent::Complete(value) => return monty_to_py(py, &value, &dc_registry),
-            TurnEvent::FunctionCall {
-                function_name,
-                args,
-                kwargs,
-                method_call,
-                ..
-            } => {
-                let result = if method_call {
-                    dispatch_method_call(py, &function_name, &args, &kwargs, &dc_registry)
-                } else if let Some(fns) = external_functions {
-                    ExternalFunctionRegistry::new(py, fns, &dc_registry).call(&function_name, &args, &kwargs)
-                } else {
-                    ExtFunctionResult::NotFound(function_name)
-                };
-                TurnAnswer::Call(ext_to_resume(result)?)
-            }
-            TurnEvent::OsCall {
-                function_name,
-                args,
-                kwargs,
-                not_handled_error,
-                ..
-            } => {
-                let result = dispatch_os_parts(
-                    py,
-                    &function_name,
-                    &args,
-                    &kwargs,
-                    not_handled_error.as_ref(),
-                    os.as_ref(),
-                    &dc_registry,
-                );
-                TurnAnswer::Call(ext_to_resume(result)?)
-            }
-            TurnEvent::NameLookup { name } => TurnAnswer::Name(resolve_pool_name_lookup(&name, external_functions)),
-            TurnEvent::ResolveFutures { .. } => {
-                return Err(PyRuntimeError::new_err("async external functions require AsyncMonty"));
-            }
+            event => match sync_turn_answer(py, event, &lookup, os.as_ref(), &dc_registry) {
+                Ok(answer) => answer,
+                Err(err) => {
+                    py.detach(|| discard_checkout(&checkout));
+                    return Err(err);
+                }
+            },
         };
         let (result, print_err) = py.detach(|| {
             run_turn_blocking(&checkout, &print_target, move |c, p| match resume_with {
@@ -1106,10 +1078,61 @@ fn drive_sync(py: Python<'_>, args: FeedArgs, external_functions: Option<&Bound<
     }
 }
 
+/// Computes the resume answer for a (non-`Complete`) sync suspension. Split out
+/// of [`drive_sync`]'s loop so a failure here — e.g. converting an
+/// `external_lookup` value for a `NameLookup` — can discard the suspended worker
+/// instead of returning while it waits forever for a resume the aborted feed
+/// will never send.
+fn sync_turn_answer(
+    py: Python<'_>,
+    event: TurnEvent,
+    lookup: &ExternalLookup<'_, '_>,
+    os: Option<&Py<PyAny>>,
+    dc_registry: &DcRegistry,
+) -> PyResult<TurnAnswer> {
+    match event {
+        TurnEvent::FunctionCall {
+            function_name,
+            args,
+            kwargs,
+            method_call,
+            ..
+        } => {
+            let result = if method_call {
+                dispatch_method_call(py, &function_name, &args, &kwargs, dc_registry)
+            } else {
+                lookup.call(&function_name, &args, &kwargs)
+            };
+            Ok(TurnAnswer::Call(ext_to_resume(result)?))
+        }
+        TurnEvent::OsCall {
+            function_name,
+            args,
+            kwargs,
+            not_handled_error,
+            ..
+        } => {
+            let result = dispatch_os_parts(
+                py,
+                &function_name,
+                &args,
+                &kwargs,
+                not_handled_error.as_ref(),
+                os,
+                dc_registry,
+            );
+            Ok(TurnAnswer::Call(ext_to_resume(result)?))
+        }
+        TurnEvent::NameLookup { name } => Ok(TurnAnswer::Name(lookup.resolve_name(&name)?)),
+        TurnEvent::ResolveFutures { .. } => Err(PyRuntimeError::new_err("async external functions require AsyncMonty")),
+        TurnEvent::Complete(_) => unreachable!("Complete is handled by the drive loop"),
+    }
+}
+
 /// Async drive loop: protocol turns run in `spawn_blocking`; coroutine
 /// external functions are spawned as tasks and resolved via
 /// `ResolveFutures`.
-async fn drive_async(args: FeedArgs, external_functions: Option<Py<PyDict>>) -> PyResult<Py<PyAny>> {
+async fn drive_async(args: FeedArgs, external_lookup: Option<Py<PyDict>>) -> PyResult<Py<PyAny>> {
     let FeedArgs {
         code,
         inputs,
@@ -1128,64 +1151,46 @@ async fn drive_async(args: FeedArgs, external_functions: Option<Py<PyDict>>) -> 
     .await?;
 
     loop {
+        // As in `drive_sync`, a failure to answer a suspension (including the
+        // futures `ResolveFutures` awaits erroring) discards the checkout.
+        // `Complete` and `ResolveFutures` stay inline — the latter must await
+        // the pending tasks.
         let answer: TurnAnswer = match event {
             TurnEvent::Complete(value) => {
                 return Python::attach(|py| monty_to_py(py, &value, &dc_registry));
             }
-            TurnEvent::FunctionCall {
-                function_name,
-                args,
-                kwargs,
-                call_id,
-                method_call,
-            } => {
-                match dispatch_function_call(
-                    &function_name,
-                    method_call,
-                    &args,
-                    &kwargs,
-                    external_functions.as_ref(),
-                    &dc_registry,
-                ) {
-                    CallResult::Sync(result) => TurnAnswer::Call(ext_to_resume(result)?),
-                    CallResult::Coroutine(coro) => {
-                        spawn_coroutine_task(&mut join_set, call_id, coro, &dc_registry)?;
-                        TurnAnswer::Call(ResumeValue::Future)
-                    }
-                }
-            }
-            TurnEvent::OsCall {
-                function_name,
-                args,
-                kwargs,
-                not_handled_error,
-                ..
-            } => {
-                let result = Python::attach(|py| {
-                    dispatch_os_parts(
-                        py,
-                        &function_name,
-                        &args,
-                        &kwargs,
-                        not_handled_error.as_ref(),
-                        os.as_ref(),
-                        &dc_registry,
-                    )
-                });
-                TurnAnswer::Call(ext_to_resume(result)?)
-            }
-            TurnEvent::NameLookup { name } => TurnAnswer::Name(Python::attach(|py| {
-                resolve_pool_name_lookup(&name, external_functions.as_ref().map(|d| d.bind(py)))
-            })),
             TurnEvent::ResolveFutures { pending_call_ids } => {
-                let results = wait_for_futures(&mut join_set, &pending_call_ids).await?;
-                let results = results
-                    .into_iter()
-                    .map(|(call_id, result)| Ok((call_id, ext_to_resume(result)?)))
-                    .collect::<PyResult<Vec<_>>>()?;
+                let resolved = wait_for_futures(&mut join_set, &pending_call_ids)
+                    .await
+                    .and_then(|results| {
+                        results
+                            .into_iter()
+                            .map(|(call_id, result)| Ok((call_id, ext_to_resume(result)?)))
+                            .collect::<PyResult<Vec<_>>>()
+                    });
+                let results = match resolved {
+                    Ok(results) => results,
+                    Err(err) => {
+                        discard_checkout_async(&checkout).await;
+                        return Err(err);
+                    }
+                };
                 event = run_turn_async(&checkout, &print_target, move |c, p| c.resume_futures(results, p)).await?;
                 continue;
             }
+            event => match async_turn_answer(
+                event,
+                external_lookup.as_ref(),
+                os.as_ref(),
+                &dc_registry,
+                &mut join_set,
+            ) {
+                Ok(answer) => answer,
+                Err(err) => {
+                    discard_checkout_async(&checkout).await;
+                    return Err(err);
+                }
+            },
         };
         event = run_turn_async(&checkout, &print_target, move |c, p| match answer {
             TurnAnswer::Call(value) => c.resume(value, p),
@@ -1193,6 +1198,77 @@ async fn drive_async(args: FeedArgs, external_functions: Option<Py<PyDict>>) -> 
         })
         .await?;
     }
+}
+
+/// Async counterpart of [`sync_turn_answer`] (minus `ResolveFutures`, which
+/// must await in [`drive_async`]'s loop): a failure here lets the loop discard
+/// the suspended worker instead of leaving it waiting forever for a resume.
+fn async_turn_answer(
+    event: TurnEvent,
+    external_lookup: Option<&Py<PyDict>>,
+    os: Option<&Py<PyAny>>,
+    dc_registry: &DcRegistry,
+    join_set: &mut JoinSet<(u32, ExtFunctionResult)>,
+) -> PyResult<TurnAnswer> {
+    match event {
+        TurnEvent::FunctionCall {
+            function_name,
+            args,
+            kwargs,
+            call_id,
+            method_call,
+        } => match dispatch_function_call(
+            &function_name,
+            method_call,
+            &args,
+            &kwargs,
+            external_lookup,
+            dc_registry,
+        ) {
+            CallResult::Sync(result) => Ok(TurnAnswer::Call(ext_to_resume(result)?)),
+            CallResult::Coroutine(coro) => {
+                spawn_coroutine_task(join_set, call_id, coro, dc_registry)?;
+                Ok(TurnAnswer::Call(ResumeValue::Future))
+            }
+        },
+        TurnEvent::OsCall {
+            function_name,
+            args,
+            kwargs,
+            not_handled_error,
+            ..
+        } => {
+            let result = Python::attach(|py| {
+                dispatch_os_parts(
+                    py,
+                    &function_name,
+                    &args,
+                    &kwargs,
+                    not_handled_error.as_ref(),
+                    os,
+                    dc_registry,
+                )
+            });
+            Ok(TurnAnswer::Call(ext_to_resume(result)?))
+        }
+        TurnEvent::NameLookup { name } => {
+            let value = Python::attach(|py| {
+                ExternalLookup::new(py, external_lookup.map(|d| d.bind(py)), dc_registry).resolve_name(&name)
+            })?;
+            Ok(TurnAnswer::Name(value))
+        }
+        TurnEvent::Complete(_) | TurnEvent::ResolveFutures { .. } => {
+            unreachable!("Complete and ResolveFutures are handled by the drive loop")
+        }
+    }
+}
+
+/// Best-effort discard of a suspended checkout from an async drive-loop error
+/// path. The caller returns the original error, so a `spawn_blocking` join
+/// failure here is deliberately ignored.
+async fn discard_checkout_async(checkout: &SharedCheckout) {
+    let checkout = Arc::clone(checkout);
+    let _ = spawn_blocking(move || discard_checkout(&checkout)).await;
 }
 
 /// The caller's answer to a suspension, paired with which resume call
@@ -1328,18 +1404,6 @@ pub(crate) fn dispatch_os_parts(
         })
     };
     call().unwrap_or_else(|err| ExtFunctionResult::Error(exc_py_to_monty(py, &err)))
-}
-
-/// Resolves a bare-name lookup against the external functions dict.
-pub(crate) fn resolve_pool_name_lookup(
-    name: &str,
-    external_functions: Option<&Bound<'_, PyDict>>,
-) -> Option<MontyObject> {
-    let value = external_functions?.get_item(name).ok().flatten()?;
-    Some(MontyObject::Function {
-        name: name.to_owned(),
-        docstring: get_docstring(&value),
-    })
 }
 
 /// Extracts `MountDir | list[MountDir] | None` into child-local mount specs.
