@@ -357,12 +357,10 @@ impl<'h> PyTrait<'h> for Value {
                 } else if matches!(vm.heap.get(*id), HeapData::Instance(_)) {
                     // Instances dispatch to a user `__repr__` (or the default), which
                     // needs the heap id to pass `self` — handled here, not at the heap
-                    // level, so no `heap_ids` insertion happens. NOTE: recursion here
-                    // re-enters the VM on the *Rust* stack and is currently NOT
-                    // bounded before the native stack overflows — a pre-existing
-                    // `evaluate_function` issue (see the "Recursive/deep `__repr__`/
-                    // `__str__`" divergence in limitations/classes.md) that also
-                    // affects `sorted`/`map`/`filter` callbacks.
+                    // level, so no `heap_ids` insertion happens. Recursion here
+                    // re-enters the VM on the *Rust* stack, bounded by
+                    // `evaluate_function`'s re-entry guard (see the "Recursive/deep
+                    // `__repr__`/`__str__`" divergence in limitations/classes.md).
                     let str_value = instance_repr(*id, vm)?;
                     defer_drop!(str_value, vm);
                     Ok(f.write_str(str_value.to_str(vm)?)?)

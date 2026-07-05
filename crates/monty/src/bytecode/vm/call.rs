@@ -6,7 +6,7 @@
 
 use std::mem;
 
-use super::{CallFrame, VM};
+use super::{CallFrame, VM, recursion::RunReentryGuard};
 use crate::{
     args::{ArgValues, KwargsValues},
     asyncio::Coroutine,
@@ -370,33 +370,47 @@ impl<T: ResourceTracker> VM<'_, T> {
     ///
     /// Returns an error for external/OS functions since those require the host to
     /// execute them and resume, which this synchronous context cannot support.
+    ///
+    /// The nested `self.run()` below recurses on the native Rust stack, so
+    /// re-entry is bounded via [`enter_run_reentry`](Self::enter_run_reentry)
+    /// at entry — before `call_function`, since a class-valued `__init__` can
+    /// recurse back in without ever pushing a frame.
     pub(crate) fn evaluate_function(
         &mut self,
         ctx: &'static str,
         callable: &Value,
         args: ArgValues,
     ) -> Result<Value, RunError> {
-        match self.call_function(callable, args)? {
+        if let Err(e) = self.enter_run_reentry() {
+            // Bailing before `call_function` takes ownership of `args`, so
+            // reclaim its refcounts here.
+            args.drop_with_heap(self);
+            return Err(e.into());
+        }
+        let mut guard = RunReentryGuard::new(self);
+        let this = &mut *guard;
+
+        match this.call_function(callable, args)? {
             CallResult::Value(v) => return Ok(v),
             CallResult::FramePushed => {
                 // A new frame was pushed for a defined function call - we need to run it
                 // to completion.
-                let stack_depth = self.frames.len();
+                let stack_depth = this.frames.len();
                 // Mark the frame as an exit point from the `run()` loop
-                self.current_frame_mut().should_return = true;
-                match self.run()? {
+                this.current_frame_mut().should_return = true;
+                match this.run()? {
                     FrameExit::Return(v) => return Ok(v),
                     exit => {
-                        exit.drop_with_heap(self);
+                        exit.drop_with_heap(this);
                         // Pop frames off the stack from this failed evaluation
                         // (including the one just pushed)
-                        while self.frames.len() >= stack_depth {
-                            self.pop_frame();
+                        while this.frames.len() >= stack_depth {
+                            this.pop_frame();
                         }
                     }
                 }
             }
-            other => other.drop_with_heap(self),
+            other => other.drop_with_heap(this),
         }
 
         Err(ExcType::not_implemented(format!(

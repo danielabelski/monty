@@ -373,10 +373,10 @@ pub(crate) fn instance_str(self_id: HeapId, vm: &mut VM<'_, impl ResourceTracker
 /// Returns `Ok(None)` if the class does not define the dunder (caller uses the
 /// default). The method runs to completion synchronously via `evaluate_function`,
 /// so — unlike `__init__` — it cannot suspend on external/OS calls (see
-/// `limitations/classes.md`). NOTE: recursion (e.g. a `__repr__` that reprs
-/// `self`) re-enters the VM on the *Rust* stack and is currently NOT bounded
-/// before the native stack overflows — a pre-existing `evaluate_function`
-/// limitation documented in `limitations/classes.md`.
+/// `limitations/classes.md`). Recursion (e.g. a `__repr__` that reprs `self`)
+/// re-enters the VM on the *Rust* stack; `evaluate_function`'s re-entry guard
+/// bounds it with a catchable `RecursionError` — lower than CPython's depth for
+/// deep-but-finite chains, a documented divergence (`limitations/classes.md`).
 fn instance_call_str_dunder(
     self_id: HeapId,
     dunder: &'static str,

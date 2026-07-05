@@ -731,6 +731,16 @@ pub struct VM<'h, T: ResourceTracker> {
     /// `malloc`/`free` per call. Only held transiently within
     /// `call_sync_function`, so one shared buffer is safe under recursion.
     namespace_scratch: Vec<Value>,
+    /// Remaining native Rust call-stack re-entry budget, counted down from
+    /// [`recursion::MAX_RUN_REENTRY_DEPTH`] only around `evaluate_function`'s
+    /// nested call into [`Self::run`] (the one place the interpreter recurses
+    /// on its own stack instead of the heap-allocated `frames` vec).
+    ///
+    /// Not serialized: a nested `run()` never reaches a snapshot boundary (its
+    /// non-`Return` exits are converted to `NotImplementedError` in
+    /// `evaluate_function`), so the budget is always full at a snapshot;
+    /// `debug_assert!`-checked in [`Self::snapshot`].
+    run_reentry_depth: u8,
 }
 
 impl<'h, T: ResourceTracker> VM<'h, T> {
@@ -757,6 +767,7 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
             pending_file_effect: None,
             recursion_depth: 0,
             namespace_scratch: Vec::new(),
+            run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
         }
     }
 
@@ -823,6 +834,8 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
             pending_file_effect: snapshot.pending_file_effect,
             recursion_depth: current_frame_depth,
             namespace_scratch: Vec::new(),
+            // Always default value at a restore boundary — see the `run_reentry_depth` field doc.
+            run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
         }
     }
 
@@ -835,6 +848,14 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
     /// This is NOT a clone - it's a transfer. After calling this, the original VM
     /// is gone and only the snapshot (+ serialized heap/namespaces) represents the state.
     pub fn snapshot(mut self) -> VMSnapshot {
+        // Always fully released (== MAX) here — see the field doc. Asserted to
+        // catch a future `run()` call site that can suspend mid-re-entry.
+        debug_assert_eq!(
+            self.run_reentry_depth,
+            recursion::MAX_RUN_REENTRY_DEPTH,
+            "VM snapshotted while inside a nested evaluate_function re-entry"
+        );
+
         // Drop cached JSON strings before consuming the VM — they are not
         // included in the snapshot and their refcounts must be decremented.
         self.json_string_cache.drop_all(self.heap);
