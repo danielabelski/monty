@@ -1,5 +1,6 @@
 import datetime
 import io
+import json
 import pathlib
 import re
 from typing import Any
@@ -317,6 +318,50 @@ caught
     assert monty_run(code, external_lookup={'fail': fail}) == parent
 
 
+def test_external_function_json_decode_error_round_trip(monty_run: RunMonty):
+    """A host-raised `json.JSONDecodeError` survives the host→Monty→host
+    round-trip: the sandbox can catch it as `json.JSONDecodeError`, and the
+    surfaced exception is the real class with its location attributes."""
+    code = """
+import json
+try:
+    fail()
+except json.JSONDecodeError as e:
+    raise e
+"""
+
+    # Constructed directly rather than via `json.loads`, whose message wording
+    # varies across Python versions (3.13/3.14 reworded the error messages).
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise json.JSONDecodeError('Expecting value', '[1,\n2,]', 6)
+
+    with pytest.raises(pydantic_monty.MontyRuntimeError) as exc_info:
+        monty_run(code, external_lookup={'fail': fail})
+    inner = exc_info.value.exception()
+    assert type(inner) is json.JSONDecodeError
+    assert str(inner) == snapshot('Expecting value: line 2 column 3 (char 6)')
+    assert (inner.msg, inner.lineno, inner.colno, inner.pos) == snapshot(('Expecting value', 2, 3, 6))
+    assert inner.doc == '[1,\n2,]'
+
+
+def test_external_function_json_decode_error_missing_attributes(monty_run: RunMonty):
+    """A host `JSONDecodeError` stripped of one of its attributes crosses into
+    the sandbox message-only (the structured capture is all-or-nothing), so it
+    surfaces back out as the plain `ValueError` fallback."""
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        exc = json.JSONDecodeError('Expecting value', '[', 1)
+        del exc.pos
+        raise exc
+
+    with pytest.raises(pydantic_monty.MontyRuntimeError) as exc_info:
+        monty_run('fail()', external_lookup={'fail': fail})
+    inner = exc_info.value.exception()
+    assert type(inner) is ValueError
+    assert not isinstance(inner, json.JSONDecodeError)
+    assert str(inner) == snapshot('Expecting value: line 1 column 2 (char 1)')
+
+
 @pytest.mark.parametrize(
     'exception_class,exception_name',
     [
@@ -332,12 +377,21 @@ caught
         (KeyError, 'KeyError'),
         (IndexError, 'IndexError'),
         (LookupError, 'LookupError'),
+        # ImportError hierarchy
+        (ImportError, 'ImportError'),
+        (ModuleNotFoundError, 'ModuleNotFoundError'),
+        # OSError hierarchy
+        (TimeoutError, 'TimeoutError'),
+        (FileNotFoundError, 'FileNotFoundError'),
+        (OSError, 'OSError'),
         # Other exceptions
         (ValueError, 'ValueError'),
         (TypeError, 'TypeError'),
         (AttributeError, 'AttributeError'),
         (NameError, 'NameError'),
         (AssertionError, 'AssertionError'),
+        (StopIteration, 'StopIteration'),
+        (re.error, 're.PatternError'),
     ],
 )
 def test_external_function_exception_hierarchy(
@@ -366,6 +420,10 @@ def test_external_function_exception_hierarchy(
         # LookupError hierarchy
         (KeyError, LookupError, 'child'),
         (IndexError, LookupError, 'child'),
+        # ImportError hierarchy
+        (ModuleNotFoundError, ImportError, 'child'),
+        # OSError hierarchy (TimeoutError is a subclass since Python 3.3)
+        (TimeoutError, OSError, 'child'),
     ],
 )
 def test_external_function_exception_caught_by_parent(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from conftest import RunMonty
 from inline_snapshot import snapshot
@@ -72,6 +74,49 @@ def test_unicode_error_message_only_fallback(monty_run: RunMonty):
     inner = exc_info.value.exception()
     assert isinstance(inner, ValueError)
     assert not isinstance(inner, UnicodeDecodeError)
+    assert str(inner) == snapshot('nope')
+
+
+def test_json_decode_error(monty_run: RunMonty):
+    # A `json.loads` failure inside the sandbox surfaces as a real
+    # `json.JSONDecodeError`: the structured `msg`/`doc`/`pos`/`lineno`/`colno`
+    # fields travel with the exception, like unicode errors above.
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run("import json\njson.loads('[1,\\n2,]')")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, json.JSONDecodeError)
+    assert isinstance(inner, ValueError)
+    assert str(inner) == snapshot('Illegal trailing comma before end of array: line 2 column 2 (char 5)')
+    assert inner.msg == snapshot('Illegal trailing comma before end of array')
+    assert inner.lineno == snapshot(2)
+    assert inner.colno == snapshot(2)
+    assert inner.pos == snapshot(5)
+    assert inner.doc == '[1,\n2,]'
+
+
+def test_json_decode_error_doc_dropped_for_huge_documents(monty_run: RunMonty):
+    # Documents over the payload size cap are not carried: `doc` is '' on the
+    # surfaced exception. The location attributes and message must still be
+    # right — the constructor recomputes them from `doc`, so this exercises
+    # the empty-doc overrides (a multi-line document makes wrong recomputed
+    # values distinguishable: from '' they would be lineno=1, colno=pos+1).
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run("import json\njson.loads('[' + '1,\\n' * 30000 + 'x')")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, json.JSONDecodeError)
+    assert str(inner) == snapshot('Expecting value: line 30001 column 1 (char 90001)')
+    assert (inner.msg, inner.lineno, inner.colno, inner.pos) == snapshot(('Expecting value', 30001, 1, 90001))
+    assert inner.doc == ''
+
+
+def test_json_decode_error_message_only_fallback(monty_run: RunMonty):
+    # A `JSONDecodeError` raised manually inside the sandbox has no location
+    # suffix to parse, so `.exception()` falls back to a `ValueError`.
+    with pytest.raises(MontyRuntimeError) as exc_info:
+        monty_run("import json\nraise json.JSONDecodeError('nope')")
+    inner = exc_info.value.exception()
+    assert isinstance(inner, ValueError)
+    assert not isinstance(inner, json.JSONDecodeError)
     assert str(inner) == snapshot('nope')
 
 

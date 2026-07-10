@@ -40,4 +40,20 @@ Rejected with `TypeError` if passed:
 
 Inherits from `ValueError` (catchable as `except ValueError:`). The class
 qualified name is `json.JSONDecodeError`; `__name__` matches CPython.
-Error messages use the same `line N column M (char K)` suffix as CPython.
+Error messages use the same `line N column M (char K)` suffix as CPython
+(counting characters, not bytes).
+
+When the input ends inside an unclosed array or object (`'['`, `'{'`,
+`'{"a"'`, …), Monty always reports `Expecting ',' delimiter`, where CPython
+distinguishes what was expected at that point (`Expecting value`,
+`Expecting property name enclosed in double quotes`,
+`Expecting ':' delimiter`). Positions match; only the message text differs.
+
+Inside the sandbox the exception is message-only: the `msg`, `doc`, `pos`,
+`lineno` and `colno` attributes CPython sets are not available. When a
+sandbox `JSONDecodeError` surfaces to the host (e.g. via `pydantic_monty`),
+it is rebuilt as a real `json.JSONDecodeError` with all five attributes from
+a structured payload attached at raise time — except that documents larger
+than 64 KiB are not carried, in which case `doc` is `''`. A `JSONDecodeError`
+raised manually inside the sandbox has no payload and surfaces as a plain
+`ValueError` carrying the message.

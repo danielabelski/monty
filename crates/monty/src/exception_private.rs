@@ -11,7 +11,7 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     defer_drop,
-    exception_public::{ExcData, MontyException, SourceMap, StackFrame, UnicodeErrorData},
+    exception_public::{ExcData, JsonErrorData, MontyException, SourceMap, StackFrame, UnicodeErrorData},
     fstring::{FormatError, ascii_escape},
     heap::{HeapData, HeapRead},
     intern::{Interns, StaticStrings, StringId},
@@ -123,13 +123,14 @@ pub enum ExcType {
     /// CPython.
     #[strum(serialize = "io.UnsupportedOperation")]
     UnsupportedOperation,
+    /// Subclass of OSError since Python 3.3 (PEP 3151).
+    TimeoutError,
 
     // --- Standalone exception types ---
     AssertionError,
     MemoryError,
     StopIteration,
     SyntaxError,
-    TimeoutError,
     TypeError,
 
     // --- Module-specific exception types ---
@@ -190,7 +191,8 @@ impl ExcType {
             // ImportError catches ModuleNotFoundError
             Self::ImportError => matches!(self, Self::ModuleNotFoundError),
             // OSError catches FileNotFoundError, FileExistsError, IsADirectoryError,
-            // NotADirectoryError, PermissionError, and io.UnsupportedOperation
+            // NotADirectoryError, PermissionError, io.UnsupportedOperation, and
+            // TimeoutError (an OSError subclass since Python 3.3)
             Self::OSError => matches!(
                 self,
                 Self::FileNotFoundError
@@ -199,6 +201,7 @@ impl ExcType {
                     | Self::NotADirectoryError
                     | Self::PermissionError
                     | Self::UnsupportedOperation
+                    | Self::TimeoutError
             ),
             // All other types only match exactly (handled by self == handler_type above)
             _ => false,
@@ -1704,16 +1707,27 @@ impl ExcType {
         SimpleException::new_msg(Self::RePatternError, msg).into()
     }
 
-    /// Creates a `json.JSONDecodeError` with CPython-compatible location suffix.
+    /// Creates a `json.JSONDecodeError` with CPython-compatible location suffix,
+    /// formatted as `{message}: line {line} column {column} (char {index})`.
     ///
-    /// Matches CPython's format:
-    /// `{message}: line {line} column {column} (char {index})`
+    /// The fields also travel in a structured [`JsonErrorData`] payload
+    /// (with `doc` capped) so hosts can rebuild the real `json.JSONDecodeError`
+    /// with its `msg`/`doc`/`pos`/`lineno`/`colno` attributes.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The bare error message, without the location suffix
+    /// * `doc` - The document being parsed (CPython's `exc.doc`)
+    /// * `line` - 1-based line of the error (CPython's `exc.lineno`)
+    /// * `column` - 1-based column of the error (CPython's `exc.colno`)
+    /// * `index` - Character index of the error in `doc` (CPython's `exc.pos`)
     #[must_use]
-    pub(crate) fn json_decode_error(message: &str, line: usize, column: usize, index: usize) -> RunError {
+    pub(crate) fn json_decode_error(message: &str, doc: &[u8], line: usize, column: usize, index: usize) -> RunError {
         SimpleException::new_msg(
             Self::JsonDecodeError,
             format!("{message}: line {line} column {column} (char {index})"),
         )
+        .with_data(JsonErrorData::build(message, doc, index, line, column))
         .into()
     }
 
