@@ -5,7 +5,6 @@ members = [
     "crates/monty-runtime",
     "crates/monty-proto",
     "crates/monty-pool",
-    "crates/monty-worker",
     "crates/monty-wasm-runtime",
     "crates/monty-python",
     "crates/monty-cpython",
@@ -55,7 +54,6 @@ monty-proto = { path = "crates/monty-proto", version = "0.0.19-beta.2" }
 monty-pool = { path = "crates/monty-pool", version = "0.0.19-beta.2" }
 monty-type-checking = { path = "crates/monty-type-checking", version = "0.0.19-beta.2" }
 monty-typeshed = { path = "crates/monty-typeshed", version = "0.0.19-beta.2" }
-monty-worker = { path = "crates/monty-worker", version = "0.0.19-beta.2" }
 # ruff, ty and related crates
 ruff_python_parser = "0.0.3"
 ruff_python_stdlib = "0.0.3"
@@ -92,6 +90,13 @@ unicode-normalization = "0.1"
 num-bigint = { version = "0.4", features = ["serde"] }
 num-traits = "0.2"
 num-integer = "0.1"
+# PyO3: one workspace pin so `pyo3` and `pyo3-build-config` (whose versions
+# must match) are always bumped together. The `pyo3` entry stays feature-free —
+# workspace-dep features are additive, and each crate needs a different set
+# (`auto-initialize` embeds CPython, `generate-import-lib`/`num-bigint`/... for
+# the extension module and conversion layers).
+pyo3 = "0.28"
+pyo3-build-config = { version = "0.28", features = ["resolve-config"] }
 # others
 itoa = "1"
 ahash = { version = "0.8.0", features = ["serde"] }

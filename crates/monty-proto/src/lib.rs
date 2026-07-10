@@ -3,8 +3,14 @@
 mod convert;
 mod frame;
 mod generated;
+// Python ↔ MontyObject value conversion; opt-in because it links pyo3, which
+// pure-Rust consumers of the wire protocol must never pay for.
+#[cfg(feature = "python")]
+pub mod python;
 mod requirement;
 mod wire;
+#[cfg(feature = "worker")]
+pub mod worker;
 
 /// The monty version this build speaks the wire protocol as, used for the
 /// `Configure.monty_version` skew check. Parent and child must be deployed in

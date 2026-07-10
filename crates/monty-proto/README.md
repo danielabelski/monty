@@ -31,6 +31,12 @@ this same protocol.
 - `MONTY_VERSION` — the version both sides compare in the `Configure`
   handshake. The protocol has no in-band negotiation, so parent and child must
   be deployed in lockstep.
+- `python` (cargo feature, off by default) — the `python` module: PyO3-based
+  conversions between live Python objects and `MontyObject`/`MontyException`,
+  shared by the `pydantic-monty` extension module and the `monty-cpython`
+  embedded-CPython worker. The feature pulls in `pyo3` (but never its
+  `extension-module` feature — how libpython is linked stays the top crate's
+  decision), so pure-Rust consumers pay nothing for it.
 
 ## Values are special-cased for performance
 
@@ -47,6 +53,12 @@ A parent must treat every frame from a (possibly compromised) child as
 untrusted input: conversions from proto to Rust are fallible by design,
 decoding enforces depth and size budgets, and nothing in this crate panics on
 malformed wire data.
+
+## Worker state machine
+
+This crate includes the `worker` feature and module
+
+A transport-agnostic Monty protocol-child state machine, shared by the native subprocess and the wasm worker.
 
 ## Monty crates
 

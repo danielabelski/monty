@@ -23,13 +23,9 @@ path = "src/lib.rs"
 ahash = { workspace = true }
 clap = { workspace = true }
 monty = { workspace = true }
-monty-proto = { workspace = true }
-# `pydantic-monty`'s lib (`_monty`) is linked as an rlib purely for its
-# Python ↔ MontyObject value-conversion layer (`convert`/`dataclass`/`exceptions`).
-# This works because that crate does not enable pyo3's `extension-module` feature
-# in Cargo, so libpython is linked and we can embed CPython here via `auto-initialize`.
-pydantic-monty = { path = "../monty-python" }
-pyo3 = { version = "0.28", features = ["auto-initialize"] }
+# `python` enables monty-proto's Python ↔ MontyObject value-conversion layer
+monty-proto = { workspace = true, features = ["python"] }
+pyo3 = { workspace = true, features = ["auto-initialize"] }
 # Blocking WebSocket transport for the `websocket` subcommand: dial a relay
 # (or a parent-as-server), with rustls for `wss://`. Matches the pool client.
 tungstenite = { workspace = true }
@@ -45,10 +41,10 @@ toml = "1.1"
 [dev-dependencies]
 # Used only by the integration tests to snapshot/restore `sys.stdout`/`sys.stderr`
 # around each run (the shared embedded interpreter outlives a single session).
-pyo3 = { version = "0.28", features = ["auto-initialize"] }
+pyo3 = { workspace = true, features = ["auto-initialize"] }
 
 [build-dependencies]
-pyo3-build-config = { version = "0.28", features = ["resolve-config"] }
+pyo3-build-config = { workspace = true }
 
 [lints]
 workspace = true
