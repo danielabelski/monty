@@ -100,6 +100,46 @@ pub(crate) enum Value {
     Dereferenced,
 }
 
+/// Scoped view of a value that keeps a referenced heap entry open for repeated operations.
+pub(crate) enum ValueRead<'h, 'v> {
+    /// Immediate values need no heap access.
+    Immediate(&'v Value),
+    /// Heap values retain both their owner and the typed heap read handle.
+    Heap {
+        _owner: &'v Value,
+        value: HeapReadOutput<'h>,
+    },
+}
+
+impl<'h> ValueRead<'h, '_> {
+    /// Advances this value without reacquiring its heap entry.
+    ///
+    /// This is the timeout boundary for Rust-side loops over retained iterators.
+    /// Bytecode iteration dispatches directly after the VM's per-opcode check.
+    pub(crate) fn py_next(&mut self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<Value>> {
+        vm.heap.check_time()?;
+        match self {
+            Self::Immediate(value) => Err(ExcType::type_error_not_iterator(&value.py_type_name(vm))),
+            Self::Heap { value, .. } => value.py_next(vm),
+        }
+    }
+
+    /// Returns the iterator's internal remaining-length hint when available.
+    pub(crate) fn iter_size_hint(&self, vm: &VM<'h, impl ResourceTracker>) -> usize {
+        match self {
+            Self::Heap {
+                value: HeapReadOutput::ListIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(vm.heap),
+            Self::Heap {
+                value: HeapReadOutput::Iter(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(vm.heap),
+            _ => 0,
+        }
+    }
+}
+
 /// Size of a single `Value` slot in bytes.
 ///
 /// Used for memory tracking when containers grow (e.g., `list.append`, `list.extend`).
@@ -1430,6 +1470,24 @@ impl<'h> PyTrait<'h> for Value {
             ))),
         }
     }
+
+    fn py_iter(&self, _: Option<HeapId>, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Self> {
+        if let Self::Ref(id) = self {
+            vm.heap.read(*id).py_iter(Some(*id), vm)
+        } else {
+            let iter = MontyIter::new(self.clone_with_heap(vm), vm)?;
+            let id = vm.heap.allocate(HeapData::Iter(iter))?;
+            Ok(Self::Ref(id))
+        }
+    }
+
+    fn py_next(&mut self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Self>> {
+        if let Self::Ref(id) = self {
+            vm.heap.read(*id).py_next(vm)
+        } else {
+            Err(ExcType::type_error_not_iterator(&self.py_type_name(vm)))
+        }
+    }
 }
 
 /// `Value` releases its (possible) heap reference through any [`ContainsHeap`]
@@ -1610,6 +1668,22 @@ impl Value {
             Ok(result)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Returns an iterator for this value using its type-specific protocol when available.
+    pub fn py_iter(&self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Self> {
+        <Self as PyTrait<'_>>::py_iter(self, None, vm)
+    }
+
+    /// Creates a scoped view that retains this value's heap reader when needed.
+    pub(crate) fn read<'h, 'v>(&'v self, vm: &VM<'h, impl ResourceTracker>) -> ValueRead<'h, 'v> {
+        match self {
+            Self::Ref(id) => ValueRead::Heap {
+                _owner: self,
+                value: vm.heap.read(*id),
+            },
+            _ => ValueRead::Immediate(self),
         }
     }
 
@@ -1800,7 +1874,7 @@ impl Value {
                     }
                     // An iterator is consumed until the item is found, as
                     // CPython's `in` does for any iterable without `__contains__`.
-                    HeapReadOutput::Iter(_) => {
+                    HeapReadOutput::Iter(_) | HeapReadOutput::ListIterator(_) => {
                         let iter = MontyIter::new(self.clone_with_heap(vm.heap), vm)?;
                         defer_drop_mut!(iter, vm);
                         loop {

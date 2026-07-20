@@ -21,6 +21,7 @@ use crate::{
         BoundMethod, Bytes, Class, Dataclass, Dict, DictItemsView, DictKeysView, DictValuesView, FrozenSet, Instance,
         LazyHeapSet, List, LongInt, Module, MontyIter, NamedTuple, OpenFile, Path, PyTrait, Range, ReMatch, RePattern,
         Set, Slice, Str, Tuple, Type, date, datetime,
+        list::ListIterator,
         str::{allocate_string, concat_allocate_str},
         timedelta, timezone,
     },
@@ -90,6 +91,8 @@ pub(crate) enum HeapData {
     /// Created by the `GetIter` opcode or `iter()` builtin, advanced by `ForIter`.
     /// Stores iteration state for lists, tuples, strings, ranges, dicts, and sets.
     Iter(MontyIter),
+    /// `list_iterator` object
+    ListIterator(ListIterator),
     /// An arbitrary precision integer (LongInt).
     ///
     /// Stored on the heap to keep `Value` enum at 16 bytes. Python has one `int` type,
@@ -237,6 +240,7 @@ impl HeapData {
             Self::DateTime(_) => Type::DateTime,
             Self::TimeDelta(_) => Type::TimeDelta,
             Self::TimeZone(_) => Type::TimeZone,
+            Self::ListIterator(_) => Type::ListIterator,
         }
     }
 
@@ -278,6 +282,7 @@ impl HeapData {
             Self::DateTime(d) => d.py_estimate_size(),
             Self::TimeDelta(d) => d.py_estimate_size(),
             Self::TimeZone(d) => d.py_estimate_size(),
+            Self::ListIterator(d) => d.py_estimate_size(),
         }
     }
 }
@@ -461,6 +466,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::Str(s) => s.py_bool(vm),
             Self::Bytes(b) => b.py_bool(vm),
             Self::List(l) => l.py_bool(vm),
+            Self::ListIterator(l) => l.py_bool(vm),
             Self::Tuple(t) => t.py_bool(vm),
             Self::NamedTuple(nt) => nt.py_bool(vm),
             Self::Dict(d) => d.py_bool(vm),
@@ -578,6 +584,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::Str(s) => s.py_type(vm),
             Self::Bytes(b) => b.py_type(vm),
             Self::List(l) => l.py_type(vm),
+            Self::ListIterator(li) => li.py_type(vm),
             Self::Tuple(t) => t.py_type(vm),
             Self::NamedTuple(nt) => nt.py_type(vm),
             Self::Dict(d) => d.py_type(vm),
@@ -655,6 +662,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
                 _ => None,
             }),
             HeapReadOutput::List(a) => a.py_eq_impl(other, vm),
+            HeapReadOutput::ListIterator(a) => a.py_eq_impl(other, vm),
             HeapReadOutput::Tuple(a) => a.py_eq_impl(other, vm),
             HeapReadOutput::NamedTuple(a) => a.py_eq_impl(other, vm),
             HeapReadOutput::Dict(a) => a.py_eq_impl(other, vm),
@@ -750,6 +758,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::Str(s) => s.py_repr_fmt(f, vm, heap_ids),
             Self::Bytes(b) => b.py_repr_fmt(f, vm, heap_ids),
             Self::List(l) => l.py_repr_fmt(f, vm, heap_ids),
+            Self::ListIterator(li) => li.py_repr_fmt(f, vm, heap_ids),
             Self::Tuple(t) => t.py_repr_fmt(f, vm, heap_ids),
             Self::NamedTuple(nt) => nt.py_repr_fmt(f, vm, heap_ids),
             Self::Dict(d) => d.py_repr_fmt(f, vm, heap_ids),
@@ -1005,6 +1014,89 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::DateTime(dt) => dt.py_getattr(attr, vm),
             Self::TimeDelta(td) => td.py_getattr(attr, vm),
             _ => Ok(None),
+        }
+    }
+
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
+        match self {
+            Self::Str(value) => value.py_iter(self_id, vm),
+            Self::Bytes(value) => value.py_iter(self_id, vm),
+            Self::List(value) => value.py_iter(self_id, vm),
+            Self::ListIterator(value) => value.py_iter(self_id, vm),
+            Self::Tuple(value) => value.py_iter(self_id, vm),
+            Self::NamedTuple(value) => value.py_iter(self_id, vm),
+            Self::Dict(value) => value.py_iter(self_id, vm),
+            Self::DictKeysView(value) => value.py_iter(self_id, vm),
+            Self::DictItemsView(value) => value.py_iter(self_id, vm),
+            Self::DictValuesView(value) => value.py_iter(self_id, vm),
+            Self::Set(value) => value.py_iter(self_id, vm),
+            Self::FrozenSet(value) => value.py_iter(self_id, vm),
+            Self::Range(value) => value.py_iter(self_id, vm),
+            Self::Slice(value) => value.py_iter(self_id, vm),
+            Self::Dataclass(value) => value.py_iter(self_id, vm),
+            Self::Class(value) => value.py_iter(self_id, vm),
+            Self::Instance(value) => value.py_iter(self_id, vm),
+            Self::BoundMethod(value) => value.py_iter(self_id, vm),
+            Self::Iter(value) => value.py_iter(self_id, vm),
+            Self::Path(value) => value.py_iter(self_id, vm),
+            Self::OpenFile(value) => value.py_iter(self_id, vm),
+            Self::ReMatch(value) => value.py_iter(self_id, vm),
+            Self::RePattern(value) => value.py_iter(self_id, vm),
+            Self::Date(value) => value.py_iter(self_id, vm),
+            Self::DateTime(value) => value.py_iter(self_id, vm),
+            Self::TimeDelta(value) => value.py_iter(self_id, vm),
+            Self::TimeZone(value) => value.py_iter(self_id, vm),
+            Self::Closure(_)
+            | Self::FunctionDefaults(_)
+            | Self::ExtFunction(_)
+            | Self::Cell(_)
+            | Self::Exception(_)
+            | Self::LongInt(_)
+            | Self::Module(_)
+            | Self::Coroutine(_)
+            | Self::GatherFuture(_)
+            | Self::ExternalFuture(_) => {
+                let self_id = self_id.expect("heap values have an id");
+                vm.heap.inc_ref(self_id);
+                let iter = MontyIter::new(Value::Ref(self_id), vm)?;
+                let iter_id = vm.heap.allocate(HeapData::Iter(iter))?;
+                Ok(Value::Ref(iter_id))
+            }
+        }
+    }
+
+    fn py_next(&mut self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<Value>> {
+        match self {
+            Self::Str(value) => value.py_next(vm),
+            Self::Bytes(value) => value.py_next(vm),
+            Self::List(value) => value.py_next(vm),
+            Self::ListIterator(value) => value.py_next(vm),
+            Self::Tuple(value) => value.py_next(vm),
+            Self::NamedTuple(value) => value.py_next(vm),
+            Self::Dict(value) => value.py_next(vm),
+            Self::DictKeysView(value) => value.py_next(vm),
+            Self::DictItemsView(value) => value.py_next(vm),
+            Self::DictValuesView(value) => value.py_next(vm),
+            Self::Set(value) => value.py_next(vm),
+            Self::FrozenSet(value) => value.py_next(vm),
+            Self::Range(value) => value.py_next(vm),
+            Self::Slice(value) => value.py_next(vm),
+            Self::Dataclass(value) => value.py_next(vm),
+            Self::Class(value) => value.py_next(vm),
+            Self::Instance(value) => value.py_next(vm),
+            Self::BoundMethod(value) => value.py_next(vm),
+            Self::Iter(value) => value.py_next(vm),
+            Self::Path(value) => value.py_next(vm),
+            Self::OpenFile(value) => value.py_next(vm),
+            Self::ReMatch(value) => value.py_next(vm),
+            Self::RePattern(value) => value.py_next(vm),
+            Self::Date(value) => value.py_next(vm),
+            Self::DateTime(value) => value.py_next(vm),
+            Self::TimeDelta(value) => value.py_next(vm),
+            Self::TimeZone(value) => value.py_next(vm),
+            other => Err(ExcType::type_error_not_iterator(
+                &other.py_type(vm).name(vm.heap, vm.interns),
+            )),
         }
     }
 }

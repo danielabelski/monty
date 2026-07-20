@@ -19,12 +19,13 @@ use std::mem;
 use crate::{
     args::ArgValues,
     bytecode::VM,
+    defer_drop,
     exception_private::{ExcType, RunError, RunResult},
     heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::{BytesId, Interns},
     resource::{ResourceError, ResourceTracker, check_estimated_size},
-    types::{PyTrait, Range, dict_view::DictView, str::allocate_char},
-    value::{VALUE_SIZE, Value},
+    types::{PyTrait, Range, Type, dict_view::DictView, str::allocate_char},
+    value::{VALUE_SIZE, Value, ValueRead},
 };
 
 /// Iterator state for Python for loops.
@@ -60,18 +61,9 @@ impl MontyIter {
             return Err(ExcType::type_error("iter(callable, sentinel) is not yet supported"));
         }
 
-        // Check if already an iterator - return self
-        if let Value::Ref(id) = &iterable
-            && matches!(vm.heap.get(*id), HeapData::Iter(_))
-        {
-            // Already an iterator - return it (refcount already correct from caller)
-            return Ok(iterable);
-        }
-
-        // Create new iterator
-        let iter = Self::new(iterable, vm)?;
-        let id = vm.heap.allocate(HeapData::Iter(iter))?;
-        Ok(Value::Ref(id))
+        let iterator = iterable.py_iter(vm);
+        iterable.drop_with(vm);
+        iterator
     }
 
     /// Creates a new MontyIter from a Value.
@@ -80,25 +72,47 @@ impl MontyIter {
     /// For strings, copies the string content for byte-offset based iteration.
     /// For ranges, the data is copied so the heap reference is dropped immediately.
     pub fn new(mut value: Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Self> {
-        if let Some(iter_value) = IterValue::new(&value, vm) {
-            // For Range, we copy next/step/len into ForIterValue::Range, so we don't need
-            // to keep the heap object alive during iteration. Drop it immediately to avoid
-            // GC issues (the Range isn't in any namespace slot, so GC wouldn't see it).
-            // Same for IterStr which copies the string content.
-            if matches!(iter_value, IterValue::Range { .. } | IterValue::IterStr { .. }) {
+        if let Value::Ref(list_id) = value {
+            let list_iterator = match vm.heap.read(list_id) {
+                HeapReadOutput::List(list) => Some(list.py_iter(Some(list_id), vm)?),
+                _ => None,
+            };
+            if let Some(list_iterator) = list_iterator {
                 value.drop_with(vm);
-                value = Value::None;
+                let heap_id = list_iterator.ref_id().expect("list iterators are heap allocated");
+                return Ok(Self {
+                    index: 0,
+                    iter_value: IterValue::Opaque { heap_id },
+                    value: list_iterator,
+                });
             }
-            Ok(Self {
-                index: 0,
-                iter_value,
-                value,
-            })
-        } else {
-            let err = ExcType::type_error_not_iterable(&value.py_type_name(vm));
-            value.drop_with(vm);
+        }
 
-            Err(err)
+        match IterValue::new(&value, vm) {
+            Ok(Some(iter_value)) => {
+                // For Range, we copy next/step/len into ForIterValue::Range, so we don't need
+                // to keep the heap object alive during iteration. Drop it immediately to avoid
+                // GC issues (the Range isn't in any namespace slot, so GC wouldn't see it).
+                // Same for IterStr which copies the string content.
+                if matches!(iter_value, IterValue::Range { .. } | IterValue::IterStr { .. }) {
+                    value.drop_with(vm);
+                    value = Value::None;
+                }
+                Ok(Self {
+                    index: 0,
+                    iter_value,
+                    value,
+                })
+            }
+            Ok(None) => {
+                let err = ExcType::type_error_not_iterable(&value.py_type_name(vm));
+                value.drop_with(vm);
+                Err(err)
+            }
+            Err(err) => {
+                value.drop_with(vm);
+                Err(err)
+            }
         }
     }
 
@@ -125,11 +139,12 @@ impl MontyIter {
     /// Returns `Err` if allocation fails (for string character iteration) or if
     /// a dict/set changes size during iteration (RuntimeError).
     pub fn for_next(&mut self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Value>> {
-        // Check timeout on every iteration step. For NoLimitTracker this is
-        // inlined as a no-op. For LimitTracker it ensures that Rust-side loops
-        // (sum, sorted, min, max, etc.) cannot bypass the VM's per-instruction
-        // timeout check by running entirely within a single bytecode instruction.
+        // Rust-side loops do not return to the bytecode dispatch loop between
+        // items, so this is their shared timeout boundary.
         vm.heap.check_time()?;
+        if let IterValue::Opaque { heap_id } = &self.iter_value {
+            return advance_opaque(*heap_id, vm);
+        }
         match &mut self.iter_value {
             IterValue::Range { next, step, len } => {
                 if self.index >= *len {
@@ -172,60 +187,35 @@ impl MontyIter {
                 len,
                 checks_mutation,
             } => {
-                // Check exhaustion for types with captured len
-                if let Some(l) = len
-                    && self.index >= *l
-                {
+                if self.index >= *len {
                     return Ok(None);
                 }
-                let i = self.index;
-                let expected_len = if *checks_mutation { *len } else { None };
-                let item = get_heap_item(vm, *heap_id, i, expected_len)?;
-                // Check for list exhaustion (list can shrink during iteration)
-                let Some(item) = item else {
-                    return Ok(None);
-                };
+                let expected_len = checks_mutation.then_some(*len);
+                let item = get_heap_item(vm, *heap_id, self.index, expected_len)?;
                 self.index += 1;
                 Ok(Some(item))
             }
-            IterValue::IterHeapRef { iter_id } => {
-                // Delegate to the terminal iterator so position is shared;
-                // `self.value` keeps it alive, so this always resolves to an Iter.
-                let target = resolve_delegate(*iter_id, vm.heap).map_err(DelegateError::into_exception)?;
-                let HeapReadOutput::Iter(mut inner) = vm.heap.read(target) else {
-                    unreachable!("resolve_delegate only returns Ok for an Iter")
-                };
-                inner.advance(vm)
-            }
+            IterValue::Opaque { .. } => unreachable!("opaque iterators return before inline dispatch"),
         }
     }
 
     /// Returns the remaining size for iterables based on current state.
     ///
-    /// For immutable types (Range, Tuple, Str, Bytes, FrozenSet), returns the exact remaining count.
-    /// For List, returns current length minus index (may change if list is mutated).
-    /// For Dict and Set, returns the captured length minus index (used for size-change detection).
+    /// For concrete iterables, returns their exact remaining count.
+    ///
+    /// Opaque iterators may provide a type-specific hint; otherwise this returns zero.
     pub fn size_hint(&self, heap: &Heap<impl ResourceTracker>) -> usize {
         let len = match &self.iter_value {
             IterValue::Range { len, .. } | IterValue::IterStr { len, .. } | IterValue::InternBytes { len, .. } => *len,
-            IterValue::HeapRef { heap_id, len, .. } => {
-                // For List (len=None), check current length dynamically
-                len.unwrap_or_else(|| {
-                    let HeapData::List(list) = heap.get(*heap_id) else {
-                        panic!("HeapRef with len=None should only be List")
-                    };
-                    list.len()
-                })
-            }
-            // The wrapper's own index is unused; report the terminal iterator's
-            // remaining length. A cyclic/over-deep chain degrades to 0, which is
-            // safe: this is only a capacity hint.
-            // A broken chain degrades to 0: this is only a capacity hint, and the
-            // consuming site raises the real error.
-            IterValue::IterHeapRef { iter_id } => match resolve_delegate(*iter_id, heap) {
-                Ok(target) => match heap.get(target) {
-                    HeapData::Iter(inner) => inner.size_hint(heap),
-                    _ => 0,
+            IterValue::HeapRef { len, .. } => *len,
+            IterValue::Opaque { heap_id } => match opaque_target(*heap_id, heap) {
+                Ok(OpaqueTarget::Iter(heap_id)) => match heap.get(heap_id) {
+                    HeapData::Iter(iter) => iter.size_hint(heap),
+                    _ => unreachable!("opaque_target validated the iterator type"),
+                },
+                Ok(OpaqueTarget::ListIterator(heap_id)) => match heap.get(heap_id) {
+                    HeapData::ListIterator(iter) => iter.size_hint(heap),
+                    _ => unreachable!("opaque_target validated the iterator type"),
                 },
                 Err(_) => 0,
             },
@@ -253,15 +243,7 @@ impl MontyIter {
         elem_size: usize,
         vm: &VM<'_, impl ResourceTracker>,
     ) -> Result<usize, ResourceError> {
-        /// Upper bound on the number of slots we are willing to reserve up front.
-        ///
-        /// Chosen so the worst-case pre-allocation (a few MiB) is small relative
-        /// to any realistic memory budget, while still avoiding repeated
-        /// reallocations for the common case of building moderate containers.
-        const MAX_PREALLOCATION_HINT: usize = 65_536;
-        let hint = self.size_hint(vm.heap);
-        check_estimated_size(hint.saturating_mul(elem_size), vm.heap.tracker())?;
-        Ok(hint.min(MAX_PREALLOCATION_HINT))
+        checked_preallocation_hint(self.size_hint(vm.heap), elem_size, vm.heap.tracker())
     }
 
     /// Materializes all remaining items into a `T` (typically `Vec<Value>`).
@@ -289,17 +271,48 @@ impl MontyIter {
     pub fn collect<T: FromIterator<Value>>(self, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<T> {
         let mut guard = DropGuard::new(self, vm);
         let (this, vm) = guard.as_parts_mut();
-        HeapedMontyIter {
-            iter: this,
-            vm,
-            yielded: 0,
+        if let IterValue::Opaque { heap_id } = &this.iter_value {
+            let target = opaque_target(*heap_id, vm.heap).map_err(OpaqueError::into_exception)?;
+            let target_id = target.heap_id();
+            vm.heap.inc_ref(target_id);
+            let target_value = Value::Ref(target_id);
+            defer_drop!(target_value, vm);
+            let mut iter = target_value.read(vm);
+            HeapedMontyIter {
+                iter: &mut iter,
+                vm,
+                yielded: 0,
+            }
+            .collect()
+        } else {
+            HeapedMontyIter {
+                iter: this,
+                vm,
+                yielded: 0,
+            }
+            .collect()
         }
-        .collect()
     }
 }
 
-/// Adapter that drives a [`MontyIter`] as a standard [`Iterator`] so it can be
-/// fed to `collect()`, while enforcing the memory budget *incrementally*.
+/// Validates and clamps an iterator capacity hint before native allocation.
+///
+/// The clamp bounds untracked preallocation to a few MiB while retaining the
+/// performance benefit for moderate containers.
+pub(crate) fn checked_preallocation_hint(
+    hint: usize,
+    elem_size: usize,
+    tracker: &impl ResourceTracker,
+) -> Result<usize, ResourceError> {
+    /// Upper bound on the number of slots reserved from an untrusted hint.
+    const MAX_PREALLOCATION_HINT: usize = 65_536;
+
+    check_estimated_size(hint.saturating_mul(elem_size), tracker)?;
+    Ok(hint.min(MAX_PREALLOCATION_HINT))
+}
+
+/// Adapts an internal iterator driver to [`Iterator`] while enforcing the
+/// memory budget incrementally.
 ///
 /// `collect()` builds a native `Vec`/`SmallVec` whose backing storage is
 /// allocated by the global Rust allocator and is invisible to Monty's resource
@@ -312,20 +325,20 @@ impl MontyIter {
 /// policy used by [`MontyIter::preallocation_hint`].
 ///
 /// [`next`]: Iterator::next
-struct HeapedMontyIter<'this, 'h, T: ResourceTracker> {
+struct HeapedMontyIter<'this, 'h, T: ResourceTracker, I: CollectIter<'h>> {
     /// The underlying iterator being drained.
-    iter: &'this mut MontyIter,
+    iter: &'this mut I,
     /// VM handle, needed both to advance `iter` and to reach the tracker.
     vm: &'this mut VM<'h, T>,
     /// Count of elements yielded so far; drives the running size estimate.
     yielded: usize,
 }
 
-impl<T: ResourceTracker> Iterator for HeapedMontyIter<'_, '_, T> {
+impl<'h, T: ResourceTracker, I: CollectIter<'h>> Iterator for HeapedMontyIter<'_, 'h, T, I> {
     type Item = RunResult<Value>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.for_next(self.vm) {
+        match self.iter.next_value(self.vm) {
             Ok(None) => None,
             Err(e) => Some(Err(e)),
             Ok(Some(value)) => {
@@ -348,17 +361,49 @@ impl<T: ResourceTracker> Iterator for HeapedMontyIter<'_, '_, T> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.iter.size_hint(self.vm.heap);
+        let remaining = self.iter.remaining(self.vm);
         (remaining, Some(remaining))
     }
 }
 
+/// Common interface for stack and retained-heap iterators drained by `collect()`.
+trait CollectIter<'h> {
+    /// Advances the iterator by one item.
+    fn next_value(&mut self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<Value>>;
+
+    /// Returns an internal remaining-length hint when available.
+    fn remaining(&self, vm: &VM<'h, impl ResourceTracker>) -> usize;
+}
+
+impl<'h> CollectIter<'h> for MontyIter {
+    fn next_value(&mut self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<Value>> {
+        self.for_next(vm)
+    }
+
+    fn remaining(&self, vm: &VM<'h, impl ResourceTracker>) -> usize {
+        self.size_hint(vm.heap)
+    }
+}
+
+impl<'h> CollectIter<'h> for ValueRead<'h, '_> {
+    fn next_value(&mut self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<Value>> {
+        self.py_next(vm)
+    }
+
+    fn remaining(&self, vm: &VM<'h, impl ResourceTracker>) -> usize {
+        self.iter_size_hint(vm)
+    }
+}
+
 impl<'h> HeapRead<'h, MontyIter> {
-    /// Advances an iterator and returns the next value.
+    /// Advances an iterator without checking the execution timeout.
     ///
-    /// Returns `Ok(None)` when the iterator is exhausted.
-    /// Returns `Err` for dict/set size changes or allocation failures.
+    /// Bytecode callers are checked by the VM dispatch loop; Rust-side loops
+    /// must use [`MontyIter::for_next`] or [`ValueRead::py_next`].
     pub(crate) fn advance(&mut self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<Value>> {
+        if let IterValue::Opaque { heap_id } = &self.get(vm.heap).iter_value {
+            return advance_opaque(*heap_id, vm);
+        }
         let this = self.get_mut(vm.heap);
         match &mut this.iter_value {
             IterValue::Range { next, step, len } => {
@@ -404,33 +449,17 @@ impl<'h> HeapRead<'h, MontyIter> {
                 len,
                 checks_mutation,
             } => {
-                if let Some(l) = len
-                    && this.index >= *l
-                {
+                if this.index >= *len {
                     return Ok(None);
                 }
-
                 let heap_id = *heap_id;
-                let expected_len = if *checks_mutation { *len } else { None };
                 let index = this.index;
+                let expected_len = checks_mutation.then_some(*len);
                 let item = get_heap_item(vm, heap_id, index, expected_len)?;
-
-                // Check for list exhaustion (list can shrink during iteration)
-                let Some(item) = item else {
-                    return Ok(None);
-                };
                 self.get_mut(vm.heap).index += 1;
                 Ok(Some(item))
             }
-            IterValue::IterHeapRef { iter_id } => {
-                // Delegate to the terminal iterator (see `for_next`).
-                let iter_id = *iter_id;
-                let target = resolve_delegate(iter_id, vm.heap).map_err(DelegateError::into_exception)?;
-                let HeapReadOutput::Iter(mut inner) = vm.heap.read(target) else {
-                    unreachable!("resolve_delegate only returns Ok for an Iter")
-                };
-                inner.advance(vm)
-            }
+            IterValue::Opaque { .. } => unreachable!("opaque iterators return before inline dispatch"),
         }
     }
 }
@@ -475,26 +504,37 @@ pub fn collect_iterable_bounded(
     Ok(items)
 }
 
-/// The most `IterHeapRef` links [`resolve_delegate`] will follow before giving up.
-///
-/// Normal code produces depth 1; the cap only bounds the walk against a cyclic
-/// chain, which is unreachable by construction but not from an untrusted snapshot.
-const MAX_DELEGATION_DEPTH: usize = 1000;
+/// The most opaque iterator links [`flatten_opaque`] follows before rejecting a chain.
+const MAX_OPAQUE_DEPTH: usize = 1000;
 
-/// Why [`resolve_delegate`] could not reach a terminal iterator.
-///
-/// Neither variant is reachable from Python — a delegating iterator always
-/// points at an `Iter` and chains never exceed depth 1 — so both exist to keep
-/// malformed snapshot data on a catchable path instead of panicking.
-enum DelegateError {
-    /// The chain exceeded [`MAX_DELEGATION_DEPTH`]; cyclic or absurdly deep.
+/// A heap iterator which can be driven without further delegation.
+#[derive(Clone, Copy)]
+enum OpaqueTarget {
+    /// A terminal general-purpose iterator.
+    Iter(HeapId),
+    /// A list iterator with independently retained state.
+    ListIterator(HeapId),
+}
+
+impl OpaqueTarget {
+    /// Returns the heap id of the validated terminal iterator.
+    fn heap_id(self) -> HeapId {
+        match self {
+            Self::Iter(heap_id) | Self::ListIterator(heap_id) => heap_id,
+        }
+    }
+}
+
+/// Why an opaque iterator could not be resolved safely.
+enum OpaqueError {
+    /// The chain was nested, cyclic, or unreasonably deep.
     TooDeep,
     /// A link pointed at a heap entry that is not an iterator.
     NotAnIterator,
 }
 
-impl DelegateError {
-    /// Converts to the `RuntimeError` the consuming site raises.
+impl OpaqueError {
+    /// Converts malformed snapshot state into a catchable runtime error.
     fn into_exception(self) -> RunError {
         match self {
             Self::TooDeep => ExcType::runtime_error_iter_delegation_too_deep(),
@@ -503,58 +543,72 @@ impl DelegateError {
     }
 }
 
-/// Follows a chain of delegating (`IterHeapRef`) iterators to the terminal
-/// iterator holding the iteration state.
+/// Flattens opaque iterator chains while constructing a stack iterator.
 ///
-/// MUST stay iterative, never recursing into `advance`: chain depth is
-/// attacker-controlled, and native recursion would overflow the stack and abort
-/// the process — uncatchable, and beyond any `ResourceTracker` limit. For the
-/// same reason a non-iterator link is reported rather than passed on to the
-/// caller, whose `heap.read` would panic on it.
-fn resolve_delegate(start: HeapId, heap: &Heap<impl ResourceTracker>) -> Result<HeapId, DelegateError> {
+/// The walk is iterative and bounded because restored snapshot data is untrusted.
+/// Its result is always safe to dispatch without another opaque hop.
+fn flatten_opaque(start: HeapId, heap: &Heap<impl ResourceTracker>) -> Result<HeapId, OpaqueError> {
     let mut current = start;
-    for _ in 0..MAX_DELEGATION_DEPTH {
-        let HeapData::Iter(inner) = heap.get(current) else {
-            return Err(DelegateError::NotAnIterator);
-        };
-        match inner.iter_value {
-            IterValue::IterHeapRef { iter_id } => current = iter_id,
-            _ => return Ok(current),
+    for _ in 0..MAX_OPAQUE_DEPTH {
+        match heap.get(current) {
+            HeapData::Iter(inner) => match inner.iter_value {
+                IterValue::Opaque { heap_id } => current = heap_id,
+                _ => return Ok(current),
+            },
+            HeapData::ListIterator(_) => return Ok(current),
+            _ => return Err(OpaqueError::NotAnIterator),
         }
     }
-    Err(DelegateError::TooDeep)
+    Err(OpaqueError::TooDeep)
+}
+
+/// Resolves a direct opaque target, rejecting nested links from malformed snapshots.
+fn opaque_target(heap_id: HeapId, heap: &Heap<impl ResourceTracker>) -> Result<OpaqueTarget, OpaqueError> {
+    match heap.get(heap_id) {
+        HeapData::Iter(inner) if matches!(inner.iter_value, IterValue::Opaque { .. }) => Err(OpaqueError::TooDeep),
+        HeapData::Iter(_) => Ok(OpaqueTarget::Iter(heap_id)),
+        HeapData::ListIterator(_) => Ok(OpaqueTarget::ListIterator(heap_id)),
+        _ => Err(OpaqueError::NotAnIterator),
+    }
+}
+
+/// Advances a direct opaque target without recursive iterator dispatch.
+fn advance_opaque(heap_id: HeapId, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Value>> {
+    match opaque_target(heap_id, vm.heap).map_err(OpaqueError::into_exception)? {
+        OpaqueTarget::Iter(heap_id) => {
+            let HeapReadOutput::Iter(mut iter) = vm.heap.read(heap_id) else {
+                unreachable!("opaque_target validated the iterator type")
+            };
+            iter.advance(vm)
+        }
+        OpaqueTarget::ListIterator(heap_id) => {
+            let HeapReadOutput::ListIterator(mut iter) = vm.heap.read(heap_id) else {
+                unreachable!("opaque_target validated the iterator type")
+            };
+            iter.py_next(vm)
+        }
+    }
 }
 
 /// Gets an item from a heap-allocated container at the given index.
 ///
-/// Returns `Ok(None)` if the index is out of bounds (for lists that shrunk during iteration).
-/// Returns `Err` if a dict/set changed size during iteration (RuntimeError).
+/// Returns an error if a dict or set changed size during iteration.
 fn get_heap_item(
     vm: &VM<'_, impl ResourceTracker>,
     heap_id: HeapId,
     index: usize,
     expected_len: Option<usize>,
-) -> RunResult<Option<Value>> {
+) -> RunResult<Value> {
     match vm.heap.get(heap_id) {
-        HeapData::List(list) => {
-            // Check if list shrunk during iteration
-            if index >= list.len() {
-                return Ok(None);
-            }
-            Ok(Some(list.as_slice()[index].clone_with_heap(vm)))
-        }
-        HeapData::Tuple(tuple) => Ok(Some(tuple.as_slice()[index].clone_with_heap(vm))),
-        HeapData::NamedTuple(namedtuple) => Ok(Some(namedtuple.as_vec()[index].clone_with_heap(vm))),
+        HeapData::Tuple(tuple) => Ok(tuple.as_slice()[index].clone_with_heap(vm)),
+        HeapData::NamedTuple(namedtuple) => Ok(namedtuple.as_vec()[index].clone_with_heap(vm)),
         HeapData::Dict(dict) => {
-            // Check for dict mutation
             if let Some(expected) = expected_len
                 && dict.len() != expected
             {
                 return Err(ExcType::runtime_error_dict_changed_size());
             }
-            Ok(Some(
-                dict.key_at(index).expect("index should be valid").clone_with_heap(vm),
-            ))
+            Ok(dict.key_at(index).expect("index should be valid").clone_with_heap(vm))
         }
         HeapData::DictKeysView(view) => {
             let dict = view.dict(vm.heap);
@@ -563,9 +617,7 @@ fn get_heap_item(
             {
                 return Err(ExcType::runtime_error_dict_changed_size());
             }
-            Ok(Some(
-                dict.key_at(index).expect("index should be valid").clone_with_heap(vm),
-            ))
+            Ok(dict.key_at(index).expect("index should be valid").clone_with_heap(vm))
         }
         HeapData::DictItemsView(view) => {
             let dict = view.dict(vm.heap);
@@ -575,10 +627,10 @@ fn get_heap_item(
                 return Err(ExcType::runtime_error_dict_changed_size());
             }
             let (key, value) = dict.item_at(index).expect("index should be valid");
-            Ok(Some(super::allocate_tuple(
+            Ok(super::allocate_tuple(
                 smallvec::smallvec![key.clone_with_heap(vm), value.clone_with_heap(vm)],
                 vm.heap,
-            )?))
+            )?)
         }
         HeapData::DictValuesView(view) => {
             let dict = view.dict(vm.heap);
@@ -587,32 +639,26 @@ fn get_heap_item(
             {
                 return Err(ExcType::runtime_error_dict_changed_size());
             }
-            Ok(Some(
-                dict.value_at(index).expect("index should be valid").clone_with_heap(vm),
-            ))
+            Ok(dict.value_at(index).expect("index should be valid").clone_with_heap(vm))
         }
-        HeapData::Bytes(bytes) => Ok(Some(Value::Int(i64::from(bytes.as_slice()[index])))),
+        HeapData::Bytes(bytes) => Ok(Value::Int(i64::from(bytes.as_slice()[index]))),
         HeapData::Set(set) => {
-            // Check for set mutation
             if let Some(expected) = expected_len
                 && set.len() != expected
             {
                 return Err(ExcType::runtime_error_set_changed_size());
             }
-            Ok(Some(
-                set.storage()
-                    .value_at(index)
-                    .expect("index should be valid")
-                    .clone_with_heap(vm),
-            ))
-        }
-        HeapData::FrozenSet(frozenset) => Ok(Some(
-            frozenset
+            Ok(set
                 .storage()
                 .value_at(index)
                 .expect("index should be valid")
-                .clone_with_heap(vm),
-        )),
+                .clone_with_heap(vm))
+        }
+        HeapData::FrozenSet(frozenset) => Ok(frozenset
+            .storage()
+            .value_at(index)
+            .expect("index should be valid")
+            .clone_with_heap(vm)),
         _ => panic!("get_heap_item: unexpected heap data type"),
     }
 }
@@ -642,16 +688,9 @@ pub fn iterator_next(
     let vm = default_guard.ctx();
 
     let Value::Ref(iter_id) = iter_value else {
-        return Err(ExcType::type_error_not_iterable(&iter_value.py_type_name(vm)));
+        return Err(ExcType::type_error_not_iterator(&iter_value.py_type_name(vm)));
     };
-
-    let result = match vm.heap.read(*iter_id) {
-        HeapReadOutput::Iter(mut iter) => iter.advance(vm)?,
-        other => {
-            let data_type = other.py_type(vm).name(vm.heap, vm.interns);
-            return Err(ExcType::type_error(format!("'{data_type}' object is not an iterator")));
-        }
-    };
+    let result = vm.heap.read(*iter_id).py_next(vm)?;
 
     // Get next item using the MontyIter::advance_on_heap method
     match result {
@@ -697,32 +736,25 @@ enum IterValue {
     },
     /// Iterating over interned bytes, yields `Value::Int` for each byte.
     InternBytes { bytes_id: BytesId, len: usize },
-    /// Delegating iterator: drives another heap-resident iterator by id, so
-    /// re-iterating an iterator (`list(iter(x))`) shares its position.
+    /// Iterating over a heap-allocated tuple, dict, bytes, set, or frozen set.
     ///
-    /// The parent's `value` holds the same ref (so it is GC-traced) and the
-    /// parent's `index` is unused.
-    IterHeapRef { iter_id: HeapId },
-    /// Iterating over a heap-allocated container (List, Tuple, NamedTuple, Dict, Bytes, Set, FrozenSet).
-    ///
-    /// - `len`: `None` for List (checked dynamically since lists can mutate during iteration),
-    ///   `Some(n)` for other types (captured at construction for exhaustion checking).
-    /// - `checks_mutation`: `true` for Dict/Set (raises RuntimeError if size changes),
-    ///   `false` for other types.
+    /// `checks_mutation` is true for dicts and sets, which reject size changes.
     HeapRef {
         heap_id: HeapId,
-        len: Option<usize>,
+        len: usize,
         checks_mutation: bool,
     },
+    /// Iterating over an iterator type not inlined in this type. It is responsible for all iteration.
+    Opaque { heap_id: HeapId },
 }
 
 impl IterValue {
-    fn new(value: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> Option<Self> {
-        match &value {
-            Value::InternString(string_id) => Some(Self::from_str(vm.interns.get_str(*string_id))),
-            Value::InternBytes(bytes_id) => Some(Self::from_intern_bytes(*bytes_id, vm.interns)),
+    fn new(value: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<Self>> {
+        match value {
+            Value::InternString(string_id) => Ok(Some(Self::from_str(vm.interns.get_str(*string_id)))),
+            Value::InternBytes(bytes_id) => Ok(Some(Self::from_intern_bytes(*bytes_id, vm.interns))),
             Value::Ref(heap_id) => Self::from_heap_data(*heap_id, vm.heap),
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -757,71 +789,66 @@ impl IterValue {
     }
 
     /// Creates an iterator value from heap data.
-    fn from_heap_data(heap_id: HeapId, heap: &Heap<impl ResourceTracker>) -> Option<Self> {
-        match heap.get(heap_id) {
-            // List: no captured len (checked dynamically), no mutation check
-            HeapData::List(_) => Some(Self::HeapRef {
-                heap_id,
-                len: None,
-                checks_mutation: false,
-            }),
+    fn from_heap_data(heap_id: HeapId, heap: &Heap<impl ResourceTracker>) -> RunResult<Option<Self>> {
+        let iter_value = match heap.get(heap_id) {
             // Tuple/NamedTuple/Bytes/FrozenSet: captured len, no mutation check
             HeapData::Tuple(tuple) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(tuple.as_slice().len()),
+                len: tuple.as_slice().len(),
                 checks_mutation: false,
             }),
             HeapData::NamedTuple(namedtuple) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(namedtuple.len()),
+                len: namedtuple.len(),
                 checks_mutation: false,
             }),
             HeapData::Bytes(b) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(b.len()),
+                len: b.len(),
                 checks_mutation: false,
             }),
             HeapData::FrozenSet(frozenset) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(frozenset.len()),
+                len: frozenset.len(),
                 checks_mutation: false,
             }),
             // Dict and dict views: captured len, WITH mutation check
             HeapData::Dict(dict) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(dict.len()),
+                len: dict.len(),
                 checks_mutation: true,
             }),
             HeapData::DictKeysView(view) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(view.dict(heap).len()),
+                len: view.dict(heap).len(),
                 checks_mutation: true,
             }),
             HeapData::DictItemsView(view) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(view.dict(heap).len()),
+                len: view.dict(heap).len(),
                 checks_mutation: true,
             }),
             HeapData::DictValuesView(view) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(view.dict(heap).len()),
+                len: view.dict(heap).len(),
                 checks_mutation: true,
             }),
             HeapData::Set(set) => Some(Self::HeapRef {
                 heap_id,
-                len: Some(set.len()),
+                len: set.len(),
                 checks_mutation: true,
             }),
             // String: copy content for iteration
             HeapData::Str(s) => Some(Self::from_str(s.as_str())),
             // Range: copy values for iteration
             HeapData::Range(range) => Some(Self::from_range(range)),
-            // An iterator is its own iterator: delegate so consumers share its
-            // position rather than restarting it.
-            HeapData::Iter(_) => Some(Self::IterHeapRef { iter_id: heap_id }),
+            HeapData::Iter(_) | HeapData::ListIterator(_) => Some(Self::Opaque {
+                heap_id: flatten_opaque(heap_id, heap).map_err(OpaqueError::into_exception)?,
+            }),
             // other types are not iterable
             _ => None,
-        }
+        };
+        Ok(iter_value)
     }
 }
 
@@ -842,67 +869,26 @@ impl HeapItem for MontyIter {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{resource::NoLimitTracker, types::List};
-
-    /// Builds a delegating iterator pointing at `target`.
-    ///
-    /// Constructed directly because Python cannot produce one: `iter()` returns
-    /// an existing iterator unchanged, so chains only arise from a snapshot.
-    fn delegating(target: HeapId) -> MontyIter {
-        MontyIter {
-            index: 0,
-            iter_value: IterValue::IterHeapRef { iter_id: target },
-            value: Value::None,
-        }
+impl<'h> PyTrait<'h> for HeapRead<'h, MontyIter> {
+    fn py_type(&self, _: &VM<'h, impl ResourceTracker>) -> Type {
+        Type::Iterator
     }
 
-    /// Builds a terminal (non-delegating) iterator over three ints.
-    fn terminal() -> MontyIter {
-        MontyIter {
-            index: 0,
-            iter_value: IterValue::Range {
-                next: 0,
-                step: 1,
-                len: 3,
-            },
-            value: Value::None,
-        }
+    fn py_len(&self, _: &VM<'h, impl ResourceTracker>) -> Option<usize> {
+        None
     }
 
-    /// A well-formed chain resolves to the terminal iterator holding the state.
-    #[test]
-    fn resolve_delegate_walks_to_the_terminal_iterator() {
-        let heap = Heap::new(16, NoLimitTracker);
-        let end = heap.allocate(HeapData::Iter(terminal())).unwrap();
-        let mid = heap.allocate(HeapData::Iter(delegating(end))).unwrap();
-        let start = heap.allocate(HeapData::Iter(delegating(mid))).unwrap();
-        assert_eq!(resolve_delegate(start, &heap).ok(), Some(end));
+    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<bool>> {
+        Ok(None)
     }
 
-    /// A link pointing at a live non-iterator must raise, not panic: the
-    /// consuming site's `heap.read` would abort the process on it.
-    #[test]
-    fn resolve_delegate_rejects_a_non_iterator_target() {
-        let heap = Heap::new(16, NoLimitTracker);
-        let list = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
-        let start = heap.allocate(HeapData::Iter(delegating(list))).unwrap();
-        let err = resolve_delegate(start, &heap).expect_err("a non-iterator target must not resolve");
-        assert!(matches!(err, DelegateError::NotAnIterator));
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
+        let self_id = self_id.expect("heap values have an id");
+        vm.heap.inc_ref(self_id);
+        Ok(Value::Ref(self_id))
     }
 
-    /// An over-long chain stops at the cap rather than walking forever, which
-    /// is what a cyclic chain from a snapshot degrades to.
-    #[test]
-    fn resolve_delegate_caps_an_over_long_chain() {
-        let heap = Heap::new(16, NoLimitTracker);
-        let mut current = heap.allocate(HeapData::Iter(terminal())).unwrap();
-        for _ in 0..=MAX_DELEGATION_DEPTH {
-            current = heap.allocate(HeapData::Iter(delegating(current))).unwrap();
-        }
-        let err = resolve_delegate(current, &heap).expect_err("a chain past the cap must not resolve");
-        assert!(matches!(err, DelegateError::TooDeep));
+    fn py_next(&mut self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<Value>> {
+        self.advance(vm)
     }
 }

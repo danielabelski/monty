@@ -124,7 +124,7 @@ impl<T: ResourceTracker> VM<'_, T> {
                     items
                 }
                 // An iterator is drained, as CPython does.
-                HeapData::Iter(_) => collect_iterable(iterable, this)?,
+                HeapData::Iter(_) | HeapData::ListIterator(_) => collect_iterable(iterable, this)?,
                 _ => {
                     let type_ = iterable.py_type_name(this);
                     return Err(ExcType::type_error_value_after_star(&type_));
@@ -389,7 +389,7 @@ impl<T: ResourceTracker> VM<'_, T> {
                     items
                 }
                 // An iterator is drained, as CPython does.
-                HeapData::Iter(_) => collect_iterable(iterable, this)?,
+                HeapData::Iter(_) | HeapData::ListIterator(_) => collect_iterable(iterable, this)?,
                 _ => {
                     let type_ = iterable.py_type_name(this);
                     return Err(ExcType::type_error_not_iterable(&type_));
@@ -587,7 +587,7 @@ impl<T: ResourceTracker> VM<'_, T> {
                     // Pull one past `count` so a too-long iterator is detected
                     // without draining it — CPython stops consuming there too,
                     // and so reports no total in the "too many" message.
-                    HeapData::Iter(_) => {
+                    HeapData::Iter(_) | HeapData::ListIterator(_) => {
                         let items = collect_iterable_bounded(value, count + 1, this)?;
                         if items.len() != count {
                             let err = if items.len() > count {
@@ -682,7 +682,7 @@ impl<T: ResourceTracker> VM<'_, T> {
                         items
                     }
                     // An iterator is drained to unpack it, as CPython does.
-                    HeapData::Iter(_) => {
+                    HeapData::Iter(_) | HeapData::ListIterator(_) => {
                         let items = collect_iterable(value, this)?;
                         if items.len() < min_items {
                             let err = unpack_ex_too_few_error(min_items, items.len());

@@ -21,7 +21,7 @@ use crate::{
     types::{
         BoundMethod, Bytes, Class, Dataclass, Dict, DictItemsView, DictKeysView, DictValuesView, FrozenSet, Instance,
         List, LongInt, Module, MontyIter, NamedTuple, OpenFile, Path, Range, ReMatch, RePattern, Set, Slice, Str,
-        TimeZone, Tuple, date, datetime, timedelta, timezone,
+        TimeZone, Tuple, date, datetime, list::ListIterator, timedelta, timezone,
     },
     value::Value,
 };
@@ -225,6 +225,7 @@ pub enum HeapReadOutput<'a> {
     Instance(HeapRead<'a, Instance>),
     BoundMethod(HeapRead<'a, BoundMethod>),
     Iter(HeapRead<'a, MontyIter>),
+    ListIterator(HeapRead<'a, ListIterator>),
     LongInt(HeapRead<'a, LongInt>),
     Module(HeapRead<'a, Module>),
     Coroutine(HeapRead<'a, Coroutine>),
@@ -614,6 +615,7 @@ impl<'a> HeapPtr<'a> {
             HeapData::Instance(instance) => HeapReadOutput::Instance(heap_read(base, instance, readers)),
             HeapData::BoundMethod(bound_method) => HeapReadOutput::BoundMethod(heap_read(base, bound_method, readers)),
             HeapData::Iter(monty_iter) => HeapReadOutput::Iter(heap_read(base, monty_iter, readers)),
+            HeapData::ListIterator(list_iter) => HeapReadOutput::ListIterator(heap_read(base, list_iter, readers)),
             HeapData::LongInt(l) => HeapReadOutput::LongInt(heap_read(base, l, readers)),
             HeapData::Module(module) => HeapReadOutput::Module(heap_read(base, module, readers)),
             HeapData::Coroutine(coroutine) => HeapReadOutput::Coroutine(heap_read(base, coroutine, readers)),
@@ -1071,7 +1073,8 @@ impl<T: ResourceTracker> Heap<T> {
         });
     }
 
-    /// Returns an immutable reference to the heap data stored at the given ID.
+    /// Returns an immutable reference to the heap data stored at the given ID. This can be more efficient
+    /// than `.read()` for short-lived borrows that need read-only access (avoids reader bookkeeping).
     ///
     /// # Panics
     /// Panics if the value ID is invalid, the value has already been freed,
@@ -1560,6 +1563,7 @@ fn for_each_child_id<F: FnMut(HeapId)>(data: &HeapData, mut on_child: F) {
                 on_child(*id);
             }
         }
+        HeapData::ListIterator(iter) => on_child(iter.list_id()),
         HeapData::Module(m) => {
             // Module attrs can contain references to heap values
             if !m.has_refs() {
@@ -1683,6 +1687,7 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
         HeapData::Instance(instance) => instance.py_dec_ref_ids(stack),
         HeapData::BoundMethod(bm) => bm.py_dec_ref_ids(stack),
         HeapData::Iter(iter) => iter.py_dec_ref_ids(stack),
+        HeapData::ListIterator(iter) => iter.py_dec_ref_ids(stack),
         HeapData::Module(m) => m.py_dec_ref_ids(stack),
         HeapData::Coroutine(coro) => {
             // Decrement ref count for namespace values that are heap references
