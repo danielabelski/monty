@@ -1764,6 +1764,54 @@ s.replace('', 'x' * 1000)
     assert_eq!(exc.exc_type(), ExcType::MemoryError);
 }
 
+/// A non-matching shrinking `str.replace` is pre-checked against the full input.
+#[test]
+fn str_replace_shrinking_memory_limit() {
+    let code = r"
+s = 'ab' * 150000
+s.replace('cd', 'a')
+";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+
+    let limits = ResourceLimits::new().max_memory(500_000);
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+
+    assert!(
+        result.is_err(),
+        "shrinking str.replace of a large input should be pre-checked"
+    );
+    let exc = result.unwrap_err();
+    assert_eq!(exc.exc_type(), ExcType::MemoryError);
+    assert_eq!(
+        exc.message(),
+        Some("memory limit exceeded: 600024 bytes > 500000 bytes")
+    );
+}
+
+/// A non-matching shrinking `bytes.replace` is pre-checked against the full input.
+#[test]
+fn bytes_replace_shrinking_memory_limit() {
+    let code = r"
+s = b'ab' * 150000
+s.replace(b'cd', b'a')
+";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+
+    let limits = ResourceLimits::new().max_memory(500_000);
+    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Stdout);
+
+    assert!(
+        result.is_err(),
+        "shrinking bytes.replace of a large input should be pre-checked"
+    );
+    let exc = result.unwrap_err();
+    assert_eq!(exc.exc_type(), ExcType::MemoryError);
+    assert_eq!(
+        exc.message(),
+        Some("memory limit exceeded: 600032 bytes > 500000 bytes")
+    );
+}
+
 /// Test that `str.ljust` with huge width is rejected before allocation.
 ///
 /// Without the pre-check, `String::with_capacity(width)` would allocate
