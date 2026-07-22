@@ -18,7 +18,7 @@ use monty_types::{CompileOptions, NoLimitTracker, PrintWriter};
 fn run_and_capture(code: &str) -> String {
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
     let mut output = String::new();
-    ex.run(vec![], NoLimitTracker, PrintWriter::CollectString(&mut output))
+    ex.run(vec![], NoLimitTracker, PrintWriter::collect_string(&mut output))
         .unwrap();
     output
 }
@@ -110,7 +110,7 @@ fn writer_reuse_accumulates() {
         CompileOptions::default(),
     )
     .unwrap();
-    ex1.run(vec![], NoLimitTracker, PrintWriter::CollectString(&mut output))
+    ex1.run(vec![], NoLimitTracker, PrintWriter::collect_string(&mut output))
         .unwrap();
 
     let ex2 = MontyRun::new(
@@ -120,7 +120,7 @@ fn writer_reuse_accumulates() {
         CompileOptions::default(),
     )
     .unwrap();
-    ex2.run(vec![], NoLimitTracker, PrintWriter::CollectString(&mut output))
+    ex2.run(vec![], NoLimitTracker, PrintWriter::collect_string(&mut output))
         .unwrap();
 
     assert_snapshot!(output, @r"
