@@ -27,10 +27,6 @@ impl SharedTracker {
 }
 
 impl ResourceTracker for SharedTracker {
-    fn on_allocate(&self, get_size: impl FnOnce() -> usize) -> Result<(), ResourceError> {
-        self.0.on_allocate(get_size)
-    }
-
     fn on_free(&self, get_size: impl FnOnce() -> usize) {
         self.0.on_free(get_size);
     }
@@ -47,8 +43,8 @@ impl ResourceTracker for SharedTracker {
         self.0.check_large_result(estimated_bytes)
     }
 
-    fn on_grow(&self, additional_bytes: usize) -> Result<(), ResourceError> {
-        self.0.on_grow(additional_bytes)
+    fn on_grow(&self, get_additional: impl FnOnce() -> usize) -> Result<(), ResourceError> {
+        self.0.on_grow(get_additional)
     }
 
     fn gc_interval(&self) -> Option<usize> {
@@ -183,7 +179,6 @@ asyncio.run(deep(20000))
 
     let limits = ResourceLimits::new()
         .max_memory(128 * 1024)
-        .max_allocations(200_000)
         .max_duration(Duration::from_secs(30));
     let tracker = LimitedTracker::new(limits);
     let result = runner.run(vec![], tracker, PrintWriter::Stdout);
@@ -193,8 +188,7 @@ asyncio.run(deep(20000))
     let msg = exc.message().expect("memory error carries a message");
     assert!(
         msg.starts_with("memory limit exceeded:"),
-        "expected memory-limit error from scheduler task accounting, \
-         not the allocation-count safety net: {msg}"
+        "expected memory-limit error from scheduler task accounting: {msg}"
     );
 }
 
@@ -215,7 +209,6 @@ asyncio.run(f())
 
     let limits = ResourceLimits::new()
         .max_memory(128 * 1024)
-        .max_allocations(50_000)
         .max_duration(Duration::from_secs(30));
     let tracker = LimitedTracker::new(limits);
     let result = runner.run(vec![], tracker, PrintWriter::Stdout);
@@ -225,7 +218,6 @@ asyncio.run(f())
     let msg = exc.message().expect("memory error carries a message");
     assert!(
         msg.starts_with("memory limit exceeded:"),
-        "expected memory-limit error from scheduler task accounting, \
-         not the allocation-count safety net: {msg}"
+        "expected memory-limit error from scheduler task accounting: {msg}"
     );
 }

@@ -19,20 +19,18 @@ use web_time::Instant;
 /// Operations that may produce results larger than this threshold (100KB) should call
 /// `check_large_result` before performing the operation. This prevents DoS attacks
 /// where operations like `2 ** 10_000_000` allocate huge amounts of memory before
-/// the allocation check can catch them.
+/// the memory check can catch them.
 pub const LARGE_RESULT_THRESHOLD: usize = 100_000;
 /// Error returned when a resource limit is exceeded during execution.
 ///
-/// This allows the sandbox to enforce strict limits on allocation count,
-/// execution time, and memory usage.
+/// This allows the sandbox to enforce strict limits on execution time
+/// and memory usage.
 ///
 /// All variants except `Recursion` are **uncatchable** inside the sandbox:
 /// untrusted code must never intercept resource enforcement. `Recursion`
 /// surfaces as a catchable `RecursionError`, matching CPython.
 #[derive(Debug, Clone)]
 pub enum ResourceError {
-    /// Maximum number of allocations exceeded.
-    Allocation { limit: usize, count: usize },
     /// Maximum execution time exceeded.
     Time { limit: Duration, elapsed: Duration },
     /// Maximum memory usage exceeded.
@@ -44,9 +42,6 @@ pub enum ResourceError {
 impl fmt::Display for ResourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Allocation { limit, count } => {
-                write!(f, "allocation limit exceeded: {count} > {limit}")
-            }
             Self::Time { limit, elapsed } => {
                 write!(f, "time limit exceeded: {elapsed:?} > {limit:?}")
             }
@@ -63,22 +58,13 @@ impl fmt::Display for ResourceError {
 impl Error for ResourceError {}
 /// Trait for tracking resource usage and scheduling garbage collection.
 ///
-/// Implementations can enforce limits on allocations, time, and memory,
-/// as well as schedule periodic garbage collection.
+/// Implementations can enforce limits on time and memory, as well as
+/// schedule periodic garbage collection.
 ///
 /// All implementations should eventually trigger garbage collection to handle
 /// reference cycles. [`gc_interval`](Self::gc_interval) controls *frequency*,
 /// not whether GC runs at all.
 pub trait ResourceTracker: fmt::Debug {
-    /// Called before each heap allocation.
-    ///
-    /// Returns `Ok(())` if the allocation should proceed, or `Err(ResourceError)`
-    /// if a limit would be exceeded.
-    ///
-    /// # Arguments
-    /// * `size` - Approximate size in bytes of the allocation
-    fn on_allocate(&self, get_size: impl FnOnce() -> usize) -> Result<(), ResourceError>;
-
     /// Called when memory is freed (during dec_ref or garbage collection).
     ///
     /// # Arguments
@@ -117,16 +103,19 @@ pub trait ResourceTracker: fmt::Debug {
     /// Returns `Ok(())` to allow the operation, or `Err(ResourceError)` to reject.
     fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError>;
 
-    /// Called when an existing heap object grows in place (e.g., `list.append`, `dict[k] = v`).
+    /// Called before tracked memory grows: a new heap allocation, in-place
+    /// container growth (`list.append`, `dict[k] = v`), or a `StringBuilder`
+    /// reservation.
     ///
-    /// Updates tracked memory and checks limits. Unlike `on_allocate`, this does not
-    /// increment the allocation count — it only tracks memory growth of an already-allocated
-    /// object. The growth is automatically balanced on free because `on_free` reads
-    /// `py_estimate_size()` which includes all grown elements.
+    /// Returns `Ok(())` if the growth should proceed, or `Err(ResourceError)`
+    /// if a limit would be exceeded. Balanced by [`on_free`](Self::on_free):
+    /// entry release reads `py_estimate_size()`, which includes in-place growth.
     ///
     /// # Arguments
-    /// * `additional_bytes` - Approximate additional memory consumed by the growth
-    fn on_grow(&self, additional_bytes: usize) -> Result<(), ResourceError>;
+    /// * `get_additional` - Lazily computes the approximate growth in bytes;
+    ///   implementations that ignore size (`NoLimitTracker`, or `LimitedTracker`
+    ///   with no memory limit) never pay for it
+    fn on_grow(&self, get_additional: impl FnOnce() -> usize) -> Result<(), ResourceError>;
 
     /// Returns the configured garbage collection interval, in GC-tracked
     /// allocations.
@@ -188,11 +177,6 @@ pub struct NoLimitTracker;
 
 impl ResourceTracker for NoLimitTracker {
     #[inline]
-    fn on_allocate(&self, _: impl FnOnce() -> usize) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    #[inline]
     fn on_free(&self, _: impl FnOnce() -> usize) {}
 
     #[inline]
@@ -201,7 +185,7 @@ impl ResourceTracker for NoLimitTracker {
     }
 
     #[inline]
-    fn on_grow(&self, _: usize) -> Result<(), ResourceError> {
+    fn on_grow(&self, _: impl FnOnce() -> usize) -> Result<(), ResourceError> {
         Ok(())
     }
 
@@ -241,8 +225,6 @@ impl ResourceTracker for NoLimitTracker {
 /// with the builder pattern.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ResourceLimits {
-    /// Maximum number of heap allocations allowed.
-    pub max_allocations: Option<usize>,
     /// Maximum execution time.
     pub max_duration: Option<Duration>,
     /// Maximum heap memory in bytes (approximate).
@@ -264,13 +246,6 @@ impl ResourceLimits {
             max_recursion_depth: Some(1000),
             ..Default::default()
         }
-    }
-
-    /// Sets the maximum number of allocations.
-    #[must_use]
-    pub fn max_allocations(mut self, limit: usize) -> Self {
-        self.max_allocations = Some(limit);
-        self
     }
 
     /// Sets the maximum execution duration.
@@ -312,9 +287,9 @@ const TIME_CHECK_INTERVAL: u16 = 10;
 
 /// A resource tracker that enforces configurable limits.
 ///
-/// Tracks allocation count, memory usage, and execution time, returning
-/// errors when limits are exceeded. Also schedules garbage collection
-/// at configurable intervals.
+/// Tracks memory usage and execution time, returning errors when limits
+/// are exceeded. Also schedules garbage collection at configurable
+/// intervals.
 ///
 /// Uses `Cell` for interior mutability to allow many methods which take
 /// `&self` (enabling `&self` on critical methods such as `Heap::allocate`).
@@ -340,8 +315,6 @@ pub struct LimitedTracker {
     /// executing.
     #[serde(skip)]
     running_since: Cell<Option<Instant>>,
-    /// Total number of allocations made.
-    allocation_count: Cell<usize>,
     /// Current approximate memory usage in bytes.
     current_memory: Cell<usize>,
     /// Counter for rate-limiting `Instant::elapsed()` calls in `check_time`.
@@ -376,7 +349,6 @@ impl LimitedTracker {
             limits,
             total_execution_time: Cell::new(Duration::ZERO),
             running_since: Cell::new(None),
-            allocation_count: Cell::new(0),
             current_memory: Cell::new(0),
             check_counter: Cell::new(0),
             recursion_limit_override: Cell::new(None),
@@ -389,13 +361,10 @@ impl LimitedTracker {
         self.recursion_limit_override.get().or(self.limits.max_recursion_depth)
     }
 
-    /// Returns the current allocation count.
-    #[must_use]
-    pub fn allocation_count(&self) -> usize {
-        self.allocation_count.get()
-    }
-
     /// Returns the current approximate memory usage.
+    ///
+    /// Only meaningful when a `max_memory` limit is configured — without one
+    /// the tracker skips memory accounting entirely and this stays 0.
     #[must_use]
     pub fn current_memory(&self) -> usize {
         self.current_memory.get()
@@ -431,57 +400,30 @@ impl LimitedTracker {
 }
 
 impl ResourceTracker for LimitedTracker {
-    fn on_allocate(&self, get_size: impl FnOnce() -> usize) -> Result<(), ResourceError> {
-        let count = self.allocation_count.get();
-        // Check allocation count limit
-        if let Some(max) = self.limits.max_allocations
-            && count >= max
-        {
-            return Err(ResourceError::Allocation {
-                limit: max,
-                count: count + 1,
-            });
+    fn on_free(&self, get_size: impl FnOnce() -> usize) {
+        // Memory is only tracked when a limit is configured (`on_grow` skips
+        // the size computation otherwise), so skip symmetrically here.
+        if self.limits.max_memory.is_some() {
+            let current = self.current_memory.get();
+            self.current_memory.set(current.saturating_sub(get_size()));
         }
+    }
 
-        let size = get_size();
-        // Check memory limit
-        let current_mem = self.current_memory.get();
+    fn on_grow(&self, get_additional: impl FnOnce() -> usize) -> Result<(), ResourceError> {
         if let Some(max) = self.limits.max_memory {
-            let new_memory = current_mem + size;
+            // Saturating: a wrapping add on 32-bit targets must not slip past
+            // the limit.
+            let new_memory = self.current_memory.get().saturating_add(get_additional());
             if new_memory > max {
                 return Err(ResourceError::Memory {
                     limit: max,
                     used: new_memory,
                 });
             }
+            self.current_memory.set(new_memory);
         }
-
-        // Update tracking state
-        self.allocation_count.set(count + 1);
-        self.current_memory.set(current_mem + size);
-
-        Ok(())
-    }
-
-    fn on_free(&self, get_size: impl FnOnce() -> usize) {
-        let current = self.current_memory.get();
-        self.current_memory.set(current.saturating_sub(get_size()));
-    }
-
-    fn on_grow(&self, additional_bytes: usize) -> Result<(), ResourceError> {
-        let current_mem = self.current_memory.get();
-        let new_memory = current_mem.saturating_add(additional_bytes);
-        if let Some(max) = self.limits.max_memory
-            && new_memory > max
-        {
-            return Err(ResourceError::Memory {
-                limit: max,
-                used: new_memory,
-            });
-        }
-        // Always update current_memory, matching on_allocate's behavior,
-        // so current_memory() remains accurate even without a memory limit.
-        self.current_memory.set(new_memory);
+        // No memory limit: skip the check AND the (possibly costly) size
+        // computation — `get_additional` is never called.
         Ok(())
     }
 
@@ -518,7 +460,6 @@ impl ResourceTracker for LimitedTracker {
     }
 
     fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError> {
-        // Check if this would exceed memory limit
         if let Some(max) = self.limits.max_memory {
             let new_memory = self.current_memory.get().saturating_add(estimated_bytes);
             if new_memory > max {
