@@ -127,6 +127,85 @@ fn unknown_imports_compile_successfully_error_deferred_to_runtime() {
 }
 
 #[test]
+fn explicit_class_annotations_assignment_returns_not_implemented_error() {
+    // The synthesized `__annotations__` is the last class-body statement, so an
+    // explicit assignment would be silently clobbered and its entries lost.
+    // CPython merges the two; Monty rejects rather than dropping them quietly.
+    let err = get_parse_err("class C:\n    __annotations__ = {'a': 'b'}\n    x: int");
+    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
+    assert_snapshot!(
+        err.message().unwrap(),
+        @"The monty syntax parser does not yet support assigning `__annotations__` in a class body with annotated names"
+    );
+}
+
+#[test]
+fn class_binding_annotations_without_annotated_names_compiles() {
+    // With nothing to store, the body's own binding stands rather than being
+    // overwritten by a synthesized empty dict — CPython accepts both of these,
+    // so rejecting them would fail class bodies that are perfectly valid.
+    for body in [
+        "__annotations__ = {'a': 'b'}",
+        "def __annotations__(self):\n        return 1",
+    ] {
+        let code = format!("class C:\n    {body}\n");
+        let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
+        assert!(result.is_ok(), "`{body}` should compile");
+    }
+}
+
+#[test]
+fn supported_future_imports_compile_successfully() {
+    // `__future__` imports are compiler directives, not real imports. All but
+    // `annotations` became mandatory in Python 3.7 or earlier and so are inert
+    // in CPython too; `annotations` is a no-op because Monty already stringizes
+    // annotations. Rejecting any of them would break otherwise-valid code.
+    for feature in ["division", "print_function", "generator_stop", "annotations"] {
+        let code = format!("from __future__ import {feature}\nx = 1");
+        let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
+        assert!(result.is_ok(), "`{feature}` should compile as a no-op");
+    }
+}
+
+#[test]
+fn unsupported_future_import_returns_not_implemented_error() {
+    // `barry_as_FLUFL` (PEP 401) is one of only two `__future__` features still
+    // meaningful in Python 3, and Monty does not implement it — it makes `<>`
+    // the inequality operator and `!=` a SyntaxError. Rejected rather than
+    // ignored, so the import cannot quietly fail to do what it says. CPython
+    // accepts it, so this is a deliberate divergence.
+    let err = get_parse_err("from __future__ import barry_as_FLUFL");
+    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
+    assert_snapshot!(
+        err.message().unwrap(),
+        @"The monty syntax parser does not yet support the 'barry_as_FLUFL' future feature"
+    );
+}
+
+#[test]
+fn aliased_future_import_returns_not_implemented_error() {
+    // The no-op binds nothing, so accepting an alias would leave the name
+    // undefined and surface as a `NameError` far from the import. CPython binds
+    // a `__future__._Feature` object, so this is a deliberate divergence.
+    let err = get_parse_err("from __future__ import annotations as ann");
+    assert_eq!(err.exc_type(), ExcType::NotImplementedError);
+    assert_snapshot!(
+        err.message().unwrap(),
+        @"The monty syntax parser does not yet support aliasing a `__future__` feature"
+    );
+}
+
+#[test]
+fn undefined_future_import_returns_syntax_error() {
+    // A name that is not a `__future__` feature at all, matching CPython's
+    // message. See `test_cases/import__future_unknown_feature.py` for the
+    // dual-run traceback test.
+    let err = get_parse_err("from __future__ import teleportation");
+    assert_eq!(err.exc_type(), ExcType::SyntaxError);
+    assert_snapshot!(err.message().unwrap(), @"future feature teleportation is not defined");
+}
+
+#[test]
 fn async_with_statement_returns_not_implemented_error() {
     // Plain `with` is supported (see `test_cases/with__all.py`); only `async with`
     // is still rejected at parse time.

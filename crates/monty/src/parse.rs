@@ -23,6 +23,7 @@ use crate::{
     fstring::{ConversionFlag, FStringPart, FormatSpec, ParsedFormatSpec, encode_format_spec},
     intern::{InternerBuilder, StringId},
     source_map::{SourceMap, StackFrameExt},
+    stringize::stringize_annotation,
     types::long_int::INT_MAX_STR_DIGITS,
     value::EitherStr,
 };
@@ -37,6 +38,31 @@ pub const MAX_NESTING_DEPTH: u16 = 200;
 /// stack overflow while still catching the error before the recursion limit.
 #[cfg(debug_assertions)]
 pub const MAX_NESTING_DEPTH: u16 = 30;
+
+/// `from __future__ import ...` features whose semantics Monty already provides,
+/// so importing them is a no-op rather than an error.
+///
+/// All but the last are inert in CPython too, having become mandatory by 3.7.
+/// `annotations` is still meaningful there, and a no-op here only because Monty
+/// stringizes unconditionally (see `limitations/typing.md`) — what it asks for.
+const SUPPORTED_FUTURES: [&str; 9] = [
+    "nested_scopes",
+    "generators",
+    "division",
+    "absolute_import",
+    "with_statement",
+    "print_function",
+    "unicode_literals",
+    "generator_stop",
+    "annotations",
+];
+
+/// `from __future__ import ...` features Monty does not implement, rejected
+/// rather than silently ignored. `barry_as_FLUFL` (PEP 401) makes `<>` the
+/// inequality operator and `!=` a `SyntaxError`; Monty parses neither
+/// differently. With [`SUPPORTED_FUTURES`] this must cover CPython's
+/// `all_feature_names` — a name in neither is reported as undefined.
+const UNSUPPORTED_FUTURES: [&str; 1] = ["barry_as_FLUFL"];
 
 /// A parameter in a function signature with optional default value.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -574,6 +600,40 @@ impl<'a> Parser<'a> {
                 ..
             }) => {
                 let position = self.convert_range(range);
+                // Compiler directives, not real imports: they bind nothing and lower
+                // to a no-op, so real-world modules import cleanly. Anything Monty
+                // does not implement is rejected rather than quietly failing to do
+                // what it says. `level == 0` keeps `from .__future__ import x` an
+                // ordinary relative import, falling through to the `ImportError`.
+                if level == 0 && module.as_ref().is_some_and(|m| m.as_str() == "__future__") {
+                    return match names
+                        .iter()
+                        .find(|a| a.asname.is_some() || !SUPPORTED_FUTURES.contains(&a.name.id.as_str()))
+                    {
+                        Some(alias) if UNSUPPORTED_FUTURES.contains(&alias.name.id.as_str()) => {
+                            Err(ParseError::not_implemented(
+                                format!("the '{}' future feature", alias.name.id),
+                                self.convert_range(alias.range),
+                            ))
+                        }
+                        // Name checks come first so an aliased unknown feature is
+                        // reported as undefined, as CPython does.
+                        Some(alias) if !SUPPORTED_FUTURES.contains(&alias.name.id.as_str()) => Err(ParseError::syntax(
+                            format!("future feature {} is not defined", alias.name.id),
+                            self.convert_range(alias.range),
+                        )),
+                        // A known feature, so the alias is what selected it. An
+                        // alias asks to bind a name and a no-op binds nothing, so
+                        // accepting it would fail exactly the way this branch
+                        // exists to prevent — the `NameError` would surface later,
+                        // far from the import.
+                        Some(alias) => Err(ParseError::not_implemented(
+                            "aliasing a `__future__` feature",
+                            self.convert_range(alias.range),
+                        )),
+                        None => Ok(Node::Pass),
+                    };
+                }
                 // We only support absolute imports (level 0)
                 if level != 0 {
                     return Err(ParseError::import_error(
@@ -716,9 +776,10 @@ impl<'a> Parser<'a> {
     /// recorded in `members`, in source order, for namespace assembly.
     ///
     /// `pass` and `...` are ignored; a leading docstring becomes a `__doc__`
-    /// member. Class decorators are supported (enclosing scope, applied
-    /// bottom-up); inheritance, function/method decorators, and anything else in
-    /// the body are rejected as not-implemented, reserving the syntax for later.
+    /// member, and annotated names a stringized `__annotations__`. Class
+    /// decorators are supported (enclosing scope, applied bottom-up);
+    /// inheritance, function/method decorators, and anything else in the body
+    /// are rejected as not-implemented, reserving the syntax for later.
     fn parse_class_def(&mut self, class: ast::StmtClassDef) -> Result<ParseNode, ParseError> {
         let position = self.class_keyword_range(&class);
         // Parsed as ordinary expressions; the compiler emits the apply calls
@@ -746,6 +807,9 @@ impl<'a> Parser<'a> {
         // namespace dict from the body's locals.
         let mut body = Vec::new();
         let mut members = Vec::new();
+        // `(name, "source text")` pairs assembled into `__annotations__` below;
+        // always stringized (PEP 563). See `limitations/typing.md`.
+        let mut annotations: Vec<DictItem> = Vec::new();
 
         // CPython stores the class docstring as a real `__doc__` entry in the
         // class dict (`None` when absent), so synthesize a `__doc__ = <docstring
@@ -795,23 +859,37 @@ impl<'a> Parser<'a> {
                     let ident = self.identifier(id, *name_range);
                     self.parse_class_var(ident, *value, &mut members, &mut body)?;
                 }
-                // `name: T = <expr>` — an annotated class-level variable. A bare
-                // `name: T` (no value) is just an annotation and creates nothing.
+                // `name: T [= <expr>]` — an annotated class-level name. The
+                // annotation is recorded (stringized) in `__annotations__`; a
+                // value additionally makes it a class variable. A bare `name: T`
+                // records the annotation but binds no value (matching CPython).
                 Stmt::AnnAssign(ast::StmtAnnAssign {
-                    target, value, range, ..
+                    target,
+                    mut annotation,
+                    value,
+                    range,
+                    ..
                 }) => {
-                    if let Some(value) = value {
-                        let AstExpr::Name(ast::ExprName {
-                            id, range: name_range, ..
-                        }) = *target
-                        else {
-                            return Err(ParseError::not_implemented(
-                                "complex class variable targets (only `name = <expr>` is allowed)",
-                                self.convert_range(range),
-                            ));
-                        };
+                    if let AstExpr::Name(ast::ExprName {
+                        id, range: name_range, ..
+                    }) = *target
+                    {
                         let ident = self.identifier(&id, name_range);
-                        self.parse_class_var(ident, *value, &mut members, &mut body)?;
+                        annotations.push(self.parse_class_annotation(ident, &mut annotation));
+                        if let Some(value) = value {
+                            self.parse_class_var(ident, *value, &mut members, &mut body)?;
+                        }
+                    } else if value.is_some() {
+                        // Complex target with a value (`x.y: T = v`) is unsupported;
+                        // a bare complex annotation (`x.y: T`) stores nothing in
+                        // CPython either, so it is ignored. CPython does still
+                        // evaluate the target expression (`undefined.attr: T` raises
+                        // `NameError`) where Monty drops it — see
+                        // `limitations/typing.md`.
+                        return Err(ParseError::not_implemented(
+                            "complex class variable targets (only `name = <expr>` is allowed)",
+                            self.convert_range(range),
+                        ));
                     }
                 }
                 // `pass` and `...` (the common `class C: ...` stub idiom) are
@@ -846,6 +924,29 @@ impl<'a> Parser<'a> {
                 object: doc_value,
             },
         );
+
+        // Last statement so the values are assembled after all members exist.
+        // Always present (empty dict) to match `Cls.__annotations__ == {}`.
+        let annotations_target = Identifier::new(self.interner.intern("__annotations__"), position);
+        let body_binds_annotations = members.iter().any(|m| m.name_id == annotations_target.name_id);
+        if body_binds_annotations && !annotations.is_empty() {
+            // Being last, the synthetic assignment would clobber the body's own
+            // binding and lose these entries. CPython stores into whatever the name
+            // holds instead — merging into a dict, `TypeError` otherwise.
+            return Err(ParseError::not_implemented(
+                "assigning `__annotations__` in a class body with annotated names",
+                position,
+            ));
+        }
+        // With nothing to store, the body's own binding stands — synthesizing an
+        // empty dict over it would break class bodies CPython accepts.
+        if !body_binds_annotations {
+            members.push(annotations_target);
+            body.push(Node::Assign {
+                target: annotations_target,
+                object: ExprLoc::new(position, Expr::Dict(annotations)),
+            });
+        }
 
         // Wrap the body statements in a synthetic zero-arg function. The class
         // name's `name_id` is reused for nicer tracebacks; this function is never
@@ -897,6 +998,20 @@ impl<'a> Parser<'a> {
             start_byte: start,
             end_byte: class.range.end().into(),
         }
+    }
+
+    /// Builds the `'name': 'annotation'` pair for one annotated class-body name.
+    ///
+    /// The annotation is stringized rather than evaluated (see
+    /// `limitations/typing.md`); [`stringize_annotation`] owns rendering it back
+    /// to the text CPython would store.
+    fn parse_class_annotation(&mut self, ident: Identifier, annotation: &mut AstExpr) -> DictItem {
+        let ann_range = annotation.range();
+        let ann_id = self.interner.intern(&stringize_annotation(annotation));
+        DictItem::Pair(
+            ExprLoc::new(ident.position, Expr::Literal(Literal::Str(ident.name_id))),
+            ExprLoc::new(self.convert_range(ann_range), Expr::Literal(Literal::Str(ann_id))),
+        )
     }
 
     /// Parses a class-variable value and records the binding: rejects class-scope
